@@ -23,8 +23,11 @@ the user explicitly requests broader profiling.
 
 ## Separation of concerns
 
-- Keep each `.cpp` file focused on one cohesive responsibility and each function
-  focused on one named operation. Compose workflows from these operations.
+- Prefer a small number of cohesive files. The current layout has six production
+  `.cpp` files, one shared header and one test file. Do not create a separate
+  source/header pair for each helper.
+- Keep each function focused on one named operation. Compose workflows from
+  these operations, grouping related helpers with their component.
 - Keep experiment orchestration independent of backend selection, socket
   transport, process ownership, measurement collection and output formatting.
 - Implement Lightning and Firecracker behind the common `Backend` interface.

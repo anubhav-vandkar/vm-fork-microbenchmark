@@ -1,7 +1,6 @@
-#include "vmbench/benchmark.hpp"
-#include "vmbench/error.hpp"
-#include "vmbench/signals.hpp"
-#include "vmbench/timing.hpp"
+#include "benchmark.hpp"
+
+
 
 namespace vmbench {
 Benchmark::Benchmark(Backend& backend, const Options& options, Observer observer)

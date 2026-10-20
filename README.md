@@ -29,11 +29,11 @@ newline-delimited JSON control socket, Firecracker's HTTP API over a Unix
 socket, the minimal guest's vsock service, procfs and cgroup files. It does not
 execute or import a Python controller. Boost.JSON is compiled into the binary.
 
-Production code lives in `src/`, interfaces in `include/vmbench/`, and tests in
-`tests/`. `src/benchmark.cpp` owns the experiment; separate Lightning and
-Firecracker backend files own their VM mechanisms. Transport, process ownership,
-measurement readers and reporting are separate components. The monolithic
-`microbench.cpp` has been removed.
+The source is organized into six production files: `main.cpp` (CLI and startup),
+`benchmark.cpp` (rounds), `vm.cpp` (VM lifecycle), `transport.cpp` (socket protocols),
+`metrics.cpp` (measurements), and `report.cpp` (output). They share `benchmark.hpp`.
+All tests live in `tests/test.cpp`. Related helpers stay with their component;
+separation of concerns does not require a separate file for every helper.
 
 ## What the two backends do
 

@@ -42,4 +42,5 @@
    VM mechanisms, transports own protocol exchanges, readers own measurement
    collection and writers own serialization. Use interfaces to keep those
    concerns independently testable, and RAII to centralize resource ownership.
-   See `ARCHITECTURE.md` for the source layout and dependency rules.
+   Group related helpers in cohesive modules; separation does not require one
+   file per helper. See `ARCHITECTURE.md` for the source layout and boundaries.
