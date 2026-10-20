@@ -1,0 +1,9 @@
+/build/
+/results/
+/local-*.json
+/local-*.txt
+/SHA256SUMS
+/*.zip
+/.agents/
+/.aws/
+/.codex/
