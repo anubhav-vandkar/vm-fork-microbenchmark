@@ -46,11 +46,12 @@ public:
     void destroy(const VmHandle& vm) override;
     void release_round(const VmHandle& root) override;
 private:
+    struct SnapshotFiles { fs::path state, memory; };
     VmHandle start_process(int id);
-    void capture_snapshot(const VmHandle& root);
-    Object snapshot_metadata(uint64_t elapsed_ns) const;
+    void capture_snapshot(const VmHandle& root, const SnapshotFiles& files);
+    Object snapshot_metadata(const SnapshotFiles& files, uint64_t elapsed_ns) const;
     void remove_socket_files(const VmHandle& vm) const;
-    fs::path state_, memory_;
+    std::map<int, SnapshotFiles> snapshots_;
 };
 Object guest_configuration(const Options& options, const fs::path& vsock);
 }
@@ -82,7 +83,7 @@ void sleep_ms(int milliseconds) {
 
 namespace vmbench {
 TemporaryDirectory::TemporaryDirectory(const std::filesystem::path& parent) {
-    const auto pattern = (parent / "lt-batch-XXXXXX").string();
+    const auto pattern = (parent / "v-XXXXXX").string();
     std::vector<char> name(pattern.begin(), pattern.end());
     name.push_back('\0');
     const char* created = mkdtemp(name.data());
@@ -301,33 +302,38 @@ VmHandle FirecrackerBackend::boot() {
     ready(root);
     return root;
 }
-void FirecrackerBackend::capture_snapshot(const VmHandle& root) {
+void FirecrackerBackend::capture_snapshot(const VmHandle& root, const SnapshotFiles& files) {
     firecracker_request(root->control, "PATCH", "/vm", {{"state", "Paused"}});
     firecracker_request(root->control, "PUT", "/snapshot/create", {
-        {"snapshot_type", "Full"}, {"snapshot_path", state_.string()},
-        {"mem_file_path", memory_.string()}, {"sync_snapshot_files", true}});
+        {"snapshot_type", "Full"}, {"snapshot_path", files.state.string()},
+        {"mem_file_path", files.memory.string()}, {"sync_snapshot_files", true}});
     firecracker_request(root->control, "PATCH", "/vm", {{"state", "Resumed"}});
 }
-Object FirecrackerBackend::snapshot_metadata(uint64_t elapsed_ns) const {
+Object FirecrackerBackend::snapshot_metadata(const SnapshotFiles& files, uint64_t elapsed_ns) const {
     struct stat metadata{};
-    require(stat(memory_.c_str(), &metadata) == 0, "Cannot stat snapshot");
-    return {{"mechanism", "one shared full snapshot per round"}, {"prepare_ns", elapsed_ns},
-        {"snapshot_state_bytes", fs::file_size(state_)}, {"snapshot_memory_bytes", static_cast<uint64_t>(metadata.st_size)},
+    require(stat(files.memory.c_str(), &metadata) == 0, "Cannot stat snapshot");
+    return {{"mechanism", "fresh full snapshot and restore"}, {"snapshot_policy", "per-fork"},
+        {"preparation_included_in_guest_ready", true}, {"prepare_ns", elapsed_ns},
+        {"snapshot_path", files.state.string()}, {"snapshot_memory_path", files.memory.string()},
+        {"snapshot_state_bytes", fs::file_size(files.state)}, {"snapshot_memory_bytes", static_cast<uint64_t>(metadata.st_size)},
         {"snapshot_allocated_bytes", static_cast<uint64_t>(metadata.st_blocks) * 512}, {"sync_snapshot_files", true}};
 }
-Object FirecrackerBackend::prepare_round(const VmHandle& root, int round) {
-    state_ = work_ / ("r" + std::to_string(round) + ".state");
-    memory_ = work_ / ("r" + std::to_string(round) + ".mem");
-    const auto started = now_ns();
-    capture_snapshot(root);
-    return snapshot_metadata(now_ns() - started);
+Object FirecrackerBackend::prepare_round(const VmHandle&, int) {
+    return {{"snapshot_policy", "per-fork"}};
 }
-CloneResult FirecrackerBackend::clone(const VmHandle&, int id) {
+CloneResult FirecrackerBackend::clone(const VmHandle& root, int id) {
+    const auto prefix = work_ / ("c" + std::to_string(id));
+    const auto [entry, inserted] = snapshots_.emplace(id, SnapshotFiles{prefix.string() + ".state", prefix.string() + ".mem"});
+    require(inserted, "Snapshot ID reused before child cleanup");
+    const auto& files = entry->second;
+    const auto started = now_ns();
+    capture_snapshot(root, files);
+    auto metadata = snapshot_metadata(files, now_ns() - started);
     auto child = start_process(id);
-    firecracker_request(child->control, "PUT", "/snapshot/load", {{"snapshot_path", state_.string()},
-        {"mem_backend", Object{{"backend_type", "File"}, {"backend_path", memory_.string()}}},
+    firecracker_request(child->control, "PUT", "/snapshot/load", {{"snapshot_path", files.state.string()},
+        {"mem_backend", Object{{"backend_type", "File"}, {"backend_path", files.memory.string()}}},
         {"vsock_override", Object{{"uds_path", child->vsock.string()}}}, {"resume_vm", true}});
-    return {child, Object{{"mechanism", "restore shared round snapshot"}}};
+    return {child, std::move(metadata)};
 }
 void FirecrackerBackend::remove_socket_files(const VmHandle& vm) const {
     fs::remove(vm->control);
@@ -340,13 +346,15 @@ void FirecrackerBackend::remove_socket_files(const VmHandle& vm) const {
 void FirecrackerBackend::destroy(const VmHandle& vm) {
     if (!vm->alive) return;
     processes_.stop(vm, SIGTERM);
+    if (const auto entry = snapshots_.find(vm->id); entry != snapshots_.end()) {
+        fs::remove(entry->second.state);
+        fs::remove(entry->second.memory);
+        snapshots_.erase(entry);
+    }
     remove_socket_files(vm);
 }
 void FirecrackerBackend::release_round(const VmHandle&) {
-    if (!state_.empty()) fs::remove(state_);
-    if (!memory_.empty()) fs::remove(memory_);
-    state_.clear();
-    memory_.clear();
+    require(snapshots_.empty(), "Snapshot backing remains after round cleanup");
 }
 }
 

@@ -18,7 +18,8 @@ int parse_integer(const std::string& value) {
     return result;
 }
 void assign_option(Options& options, const std::string& key, const std::string& value) {
-    if (key == "--repo") options.repo = value;
+    if (key == "--repo" || key == "--lightning-source") options.repo = value;
+    else if (key == "--firecracker-source") options.firecracker_repo = value;
     else if (key == "--backend") options.backend = value;
     else if (key == "--lightning") options.lightning = value;
     else if (key == "--firecracker") options.firecracker = value;
@@ -45,8 +46,9 @@ void validate_options(const Options& options) {
 }
 void resolve_paths(Options& options) {
     options.repo = fs::absolute(options.repo);
+    options.firecracker_repo = fs::absolute(options.firecracker_repo);
     if (options.lightning.empty()) options.lightning = options.repo / "build/cargo_target/release/lightning";
-    if (options.firecracker.empty()) options.firecracker = options.repo / "build/cargo_target/release/firecracker";
+    if (options.firecracker.empty()) options.firecracker = options.firecracker_repo / "build/cargo_target/release/firecracker";
     for (auto* path : {&options.lightning, &options.firecracker, &options.kernel, &options.initrd, &options.output, &options.work_dir, &options.cgroup}) {
         if (!path->empty()) *path = fs::absolute(*path);
     }
@@ -54,8 +56,15 @@ void resolve_paths(Options& options) {
 }
 Options parse_options(int argc, char** argv) {
     Options options;
+    if (argc > 1 && std::string(argv[1]) == "--report-only") {
+        require(argc == 3, "Usage: vm-fork-bench --report-only RUN_DIRECTORY");
+        options.command = Command::ReportOnly;
+        options.output = fs::absolute(argv[2]);
+        return options;
+    }
     const char* home = std::getenv("HOME");
-    options.repo = fs::path(home ? home : ".") / "Projects/lightning-main";
+    options.repo = fs::path(home ? home : ".") / "lightning";
+    options.firecracker_repo = fs::path(home ? home : ".") / "firecracker";
     for (int index = 1; index < argc; ++index) {
         const std::string key = argv[index];
         if (key == "--help") { options.command = Command::Help; return options; }
@@ -70,9 +79,11 @@ Options parse_options(int argc, char** argv) {
 }
 void print_help(std::ostream& output) {
     output << "vm-fork-bench --backend lightning|firecracker --kernel VMLINUX --initrd INITRD --output NEW_DIR\n"
-              "  [--repo DIR] [--lightning BIN] [--firecracker BIN] [--rounds 50] [--forks-per-round 50]\n"
+              "  [--lightning-source DIR] [--firecracker-source DIR] [--lightning BIN] [--firecracker BIN]\n"
+              "  [--repo DIR (alias for --lightning-source)] [--rounds 50] [--forks-per-round 50]\n"
               "  [--memory-mib 256] [--vcpus 1] [--huge-pages None|Transparent] [--settle-ms 200]\n"
-              "  [--work-dir /tmp] [--cgroup-dir DIR] [--preflight] | --self-test\n";
+              "  [--work-dir /tmp] [--cgroup-dir DIR] [--preflight] | --self-test\n"
+              "vm-fork-bench --report-only EXISTING_RUN_DIRECTORY\n";
 }
 }
 
@@ -86,6 +97,8 @@ Object inspect_host(const Options& options) {
         {"firecracker_binary_exists", fs::is_regular_file(options.firecracker)},
         {"kernel_exists", fs::is_regular_file(options.kernel)}, {"initrd_exists", fs::is_regular_file(options.initrd)},
         {"rounds", options.rounds}, {"forks_per_round", options.per_round},
+        {"firecracker_snapshot_policy", "per-fork"},
+        {"lightning_source", options.repo.string()}, {"firecracker_source", options.firecracker_repo.string()},
         {"total_forks", options.rounds * options.per_round}, {"maximum_live_vms", options.per_round + 1},
         {"memory_mib", options.memory_mib}, {"vcpus", options.vcpus}, {"huge_pages", options.huge_pages},
         {"cgroup", options.cgroup.string()}, {"thp_policy", optional_text("/sys/kernel/mm/transparent_hugepage/enabled")}};
@@ -110,8 +123,10 @@ int run_test_executable() {
     throw std::runtime_error("Cannot execute tests");
 }
 Object initial_summary(const Options& options, const Object& inspection) {
-    return {{"backend", options.backend}, {"preflight", inspection}, {"status", "running"}, {"language", "C++20"},
+    return {{"backend", options.backend}, {"snapshot_policy", options.backend == "firecracker" ? "per-fork" : "live-fork"},
+        {"creation_timing_includes_preparation", true}, {"preflight", inspection}, {"status", "running"}, {"language", "C++20"},
         {"controller_pid", getpid()}, {"source_repo", options.repo.string()}, {"kernel", options.kernel.string()},
+        {"firecracker_source_repo", options.firecracker_repo.string()},
         {"initrd", options.initrd.string()}, {"binary", (options.backend == "lightning" ? options.lightning : options.firecracker).string()},
         {"allocation_policy", "No added buffer; minimal booted guest and round counter only"}, {"mounts", optional_text("/proc/mounts")}};
 }
@@ -154,6 +169,12 @@ int run_measurement(const Options& options, const Object& inspection) {
 int dispatch(Options options) {
     if (options.command == Command::Help) { print_help(std::cout); return 0; }
     if (options.command == Command::SelfTest) return run_test_executable();
+    if (options.command == Command::ReportOnly) {
+        const auto project = fs::read_symlink("/proc/self/exe").parent_path().parent_path();
+        generate_saved_report(options.output, project / "templates/results-dashboard.html");
+        std::cout << "Reporting passed; no VMs started. Results: " << options.output << '\n';
+        return 0;
+    }
     if (options.cgroup.empty()) options.cgroup = find_cgroup();
     const auto inspection = inspect_host(options);
     if (options.command == Command::Preflight) { std::cout << json::serialize(inspection) << '\n'; return 0; }

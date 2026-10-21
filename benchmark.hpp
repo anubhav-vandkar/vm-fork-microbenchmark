@@ -73,9 +73,9 @@ private:
 }
 
 namespace vmbench {
-enum class Command { Run, Help, Preflight, SelfTest };
+enum class Command { Run, Help, Preflight, SelfTest, ReportOnly };
 struct Options {
-    fs::path repo, lightning, firecracker, kernel, initrd, output, work_dir = "/tmp", cgroup;
+    fs::path repo, firecracker_repo, lightning, firecracker, kernel, initrd, output, work_dir = "/tmp", cgroup;
     std::string backend, huge_pages = "None";
     int rounds = 50, per_round = 50, memory_mib = 256, vcpus = 1, settle_ms = 200;
     Command command = Command::Run;
@@ -236,6 +236,8 @@ private:
     std::vector<uint64_t> readiness_times_;
     std::optional<int64_t> root_pss_, peak_pss_, final_pss_;
 };
+Object analyze_saved_backend(const fs::path& directory);
+void generate_saved_report(const fs::path& directory, const fs::path& dashboard_template);
 }
 
 namespace vmbench {

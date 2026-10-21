@@ -10,9 +10,10 @@
    most 51 VMs alive. The next round cannot start until cleanup finishes.
 
 3. **Compare documented mechanisms.** Lightning performs live process forks and
-   reconstructs independent KVM objects. Firecracker restores 50 children from
-   one shared full snapshot per round. Snapshot preparation is measured separately
-   from each child's restoration, and its memory/storage cost remains visible.
+   reconstructs independent KVM objects. Firecracker takes a fresh synchronized
+   full snapshot before each child and restores from that child's unique files.
+   Preparation is inside the child's creation timer and also reported as a
+   component. Retain backing until child exit and expose its memory/storage cost.
 
 4. **Measure shared memory correctly.** Use summed PSS as the primary resident
    process-group footprint. RSS can double-count shared pages. Record private
@@ -27,6 +28,11 @@
    fork/API return, guest readiness, snapshot preparation and destruction time.
    Collection and intentional settling are outside the per-child creation timer,
    although instrumentation can still perturb subsequent operations.
+   For one combined creation number, sum child readiness durations and divide by
+   completed children: every Firecracker duration already includes preparation.
+   Do not add preparation twice or add component medians. Historical per-round
+   runs retain their original timing boundaries and policy labels. Do not call
+   the creation mean total suite wall time.
 
 7. **Keep kernel inspection focused.** Collect KVM VM/vCPU descriptor information,
    secondary page-table bytes and optional readable per-VM MMU/fault/exit counters.

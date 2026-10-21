@@ -1,0 +1,27 @@
+<div id="vmbench-saved-results">
+  <h3>VM fork results and metadata</h3>
+  <div class="text-small text-muted">{{rounds}} rounds × {{children}} children per backend · {{memory}} MiB configured RAM · {{vcpus}} vCPU</div>
+  <div class="text-small text-muted">Firecracker snapshot policy: {{snapshot_policy}}</div>
+  <div class="viz-grid">
+    <div class="card viz-stat">
+      <div>Lightning creation (ms/child)</div><div class="viz-stat-value tabular-nums">{{lightning_creation}}</div>
+      <div class="text-small">Mean including preparation</div>
+    </div>
+    <div class="card viz-stat">
+      <div>Firecracker creation (ms/child)</div><div class="viz-stat-value tabular-nums">{{firecracker_creation}}</div>
+      <div class="text-small">Mean including preparation</div>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm">
+      <caption class="sr-only">Actual VM measurements with memory, timing and KVM metadata comparison</caption>
+      <thead><tr><th scope="col">Measurement</th><th scope="col" class="text-end">Lightning</th><th scope="col" class="text-end">Firecracker</th></tr></thead>
+      <tbody>{{rows}}</tbody>
+    </table>
+  </div>
+  <div class="text-small text-muted">PSS: guest RAM and VMM memory · Cgroup: controller, VMMs, kernel and charged cache</div>
+  <div class="text-small text-muted">{{creation_boundary}} · Excludes settling, collection, parent boot and cleanup</div>
+  <div class="text-small text-muted">Reporting and lifecycle audits: passed · No VM reruns</div>
+  <div class="text-small text-muted">KVM debugfs: {{debugfs}}</div>
+  <div class="text-small text-muted">vCPU fd aliases are references · Secondary page tables are a subset of KVM memory</div>
+</div>

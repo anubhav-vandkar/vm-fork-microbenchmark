@@ -21,10 +21,25 @@ repeated over 50 rounds?** Compare the same fields for Lightning and Firecracker
 | Batch destruction elapsed time | Controller | Time to shut down/reap children and release snapshot backing |
 | FC snapshot state bytes | Snapshot file size | Serialized CPU/device state size; includes userspace state, not live KVM allocation bytes |
 | FC snapshot RAM logical/allocated bytes | `stat` | Storage/backing cost; actual resident cache can differ |
-| Snapshot preparation time | Controller | Report separately from restore-per-child latency |
+| Snapshot preparation time and count | Controller | One fresh synchronized full snapshot per child; duration is a component of guest readiness |
+| Snapshot policy and unique backing paths | Run summary and per-child metadata | Audit that no snapshot was reused |
+| Combined creation time, mean | Sum raw child readiness durations, divide by completed children | Every child timer already includes its preparation; excludes settling, sampling, parent boot and cleanup |
 
 The raw cgroup CPU/IO counters are also saved as context; they include controller
 work in a shared group. They do not identify individual kernel objects.
+
+The Firecracker child timer starts before pausing the parent and ends after the
+restored guest answers the readiness check. It includes full snapshot creation,
+synchronization, parent resume, child process launch and restore. There are 2,500
+preparations for 2,500 children. Preparation remains separately observable, but
+must not be added again to the child timer. Lightning's timer covers live fork
+and readiness. Compute means from raw durations rather than component medians.
+At most 50 distinct RAM snapshot files remain live in a batch; file cache and
+sharing differ from the historical shared-snapshot workload.
+
+Old saved runs without a policy field are treated as historical per-round reuse:
+their combined mean adds the measured round preparations to child durations.
+Reports retain this label and never extrapolate fresh-snapshot measurements.
 
 ## Minimal KVM metadata — no broad kernel profiling
 
@@ -61,7 +76,7 @@ For each round and backend:
 4. Check that parent fd/thread counts recover and the next round starts with
    one live VM. Check KVM descriptors on children for unexpected inherited references.
 5. Report snapshot preparation and backing costs alongside clone timings, so
-   the Firecracker baseline's shared snapshot remains visible.
+   the Firecracker baseline's per-child snapshot cost remains visible.
 
 Use repeated runs and matched host/VM settings before making a percentage or
 bytes-per-VM claim. Historical repository measurements and simulated controller

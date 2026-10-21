@@ -41,15 +41,19 @@ separation of concerns does not require a separate file for every helper.
 private guest RAM mappings and rebuilds its own KVM VM/vCPU objects. The code in
 the supplied repository explicitly drops inherited KVM owners in children.
 
-**Firecracker:** create one full snapshot from the parent at the start of each
-round, resume the parent, then restore 50 independent children from that same
-immutable snapshot with separate vsock endpoints. Release the snapshot after
-all 50 children have exited. Snapshot preparation time/state-file size/RAM-file
-size are recorded separately from child restoration times.
+**Firecracker:** before every child, pause the persistent parent, create a fresh
+full snapshot with synchronization enabled, resume the parent, then restore the
+child with its own vsock endpoint. Each child has unique immutable state/RAM
+files, retained until that child exits. Fifty rounds of 50 children therefore
+create **2,500 snapshots**, each inside its child's creation timer.
+Preparation duration and state/RAM file sizes remain visible as components;
+the combined creation metric includes preparation exactly once.
 
-This shared-snapshot baseline allows siblings to share snapshot-backed pages;
-it avoids creating 50 unrelated RAM snapshot files for a single identical source.
-Snapshot synchronization is explicitly enabled. Full snapshot creation can
+At 256 MiB configured RAM, 50 retained snapshots represent 12.5 GiB of logical
+RAM files per batch, and the full run writes 625 GiB of logical RAM snapshot
+data. Actual allocated storage, physical writes and resident cache depend on
+the filesystem and host. Files are deleted after each child exits, so 2,500
+snapshots do not accumulate on disk. Full snapshot creation can
 populate guest RAM and file cache; resulting footprint differences are part of
 the reported mechanism, not necessarily differences in pure metadata size.
 Upstream Firecracker has no equivalent live-fork endpoint.
@@ -86,19 +90,76 @@ an explicit `SKIP` is printed if the execution sandbox denies socket sends.
 It **does not create KVM VMs**.
 
 Actual VM runs require x86_64 Linux with read/write access to `/dev/kvm`, built
-VMM binaries, and a compatible guest kernel/initramfs. On the machine where
-this artifact was prepared, `/dev/kvm` and those built VMM/kernel artifacts were
-unavailable. The C++ controller builds and its non-VM checks pass; no VM resource
-results are claimed.
+VMM binaries, and a compatible guest kernel/initramfs. Controller tests include
+a local simulated Firecracker API; they do not execute KVM VMs. Historical runs
+using one shared snapshot per round do not validate or measure this new policy.
+
+## Repeat the full suite with project-local dependencies
+
+On a Linux x86_64 host, `scripts/prepare-local.sh LIGHTNING_SOURCE [FIRECRACKER_SOURCE]`
+prepares Rust 1.97.0, Lightning, an independent Firecracker baseline,
+a Linux 6.1.128 guest kernel and the minimal initramfs. Downloads, compiler
+caches, sources and outputs remain under this project. It needs the native build
+tools listed below, plus Clang/LLVM tools, jq and flock. It does not use sudo or
+modify shell profiles. The guest kernel uses Clang and disables the system
+trusted keyring to avoid the old kernel's OpenSSL ENGINE build dependency.
+The final kernel config and dependency versions are saved with the run.
+
+```sh
+./scripts/prepare-local.sh --check-sources "$HOME/lightning" "$HOME/firecracker"
+./scripts/prepare-local.sh "$HOME/lightning" "$HOME/firecracker"
+./scripts/run-full-suite.sh
+```
+
+Both source directories are configurable. Alternatively set `LIGHTNING_SOURCE`
+and `FIRECRACKER_SOURCE` when invoking `prepare-local.sh`; positional paths take
+precedence. Lightning defaults to `~/lightning`. Omitting the Firecracker path
+downloads upstream commit `fd9fc7a9f164b73002d22065d17c150d8c262d91`.
+The sources are copied into `build/deps` and built into `build/vmm` without
+modifying your checkouts. The runner uses these prepared copies and binaries;
+rerun preparation after changing a source path or checkout. Source paths,
+commits, copied source hashes and binary hashes are recorded for reproducibility.
+Use a compatible independent Firecracker checkout with the APIs described below.
+
+For direct controller runs, `--lightning-source DIR` and `--firecracker-source DIR`
+select separate source trees (defaults `~/lightning` and `~/firecracker`).
+`--repo` remains an alias for `--lightning-source`. Their default binaries are
+`DIR/build/cargo_target/release/lightning` and
+`DIR/build/cargo_target/release/firecracker`; use `--lightning BIN` and
+`--firecracker BIN` for other build locations. The controller does not build sources.
+
+The runner performs 50 rounds of 50 children for each backend, sequentially,
+with 256 MiB configured RAM, one vCPU and a 200 ms settling delay. It verifies
+2,500 completions per backend and clean teardown. It uses a separate user
+systemd scope per backend when available, and records shared-cgroup fallback
+explicitly. Results live under `results/full-suite/run-*`, with `latest` pointing
+to the latest attempt. Temporary sockets and snapshots stay under `build/w`.
+Paths should remain short enough for Unix sockets; use a similarly short project
+path on the server. `make clean` removes the prepared dependencies too.
+
+Regenerate just the final report and metadata dashboard from an existing run:
+
+```sh
+./scripts/run-full-suite.sh --report-only results/full-suite/latest
+```
+
+This starts no VMs and requires no KVM access. It validates both raw lifecycle
+streams and their summary statistics, then writes `comparison.json`, `report.md`,
+`dashboard.html` and `reporting-status.json` in that run directory. Historical
+launcher status and raw measurements stay intact. New full runs invoke this
+reporting step automatically after both backend runs pass validation.
+New reports require one unique snapshot preparation per Firecracker child.
+Old runs without a policy field remain labeled as historical per-round reuse;
+their durations are never multiplied to estimate fresh-snapshot results.
 
 ## Build the VM binaries and minimal guest on the KVM machine
 
-The expected Lightning checkout is `~/Projects/lightning-main`.
+The default Lightning checkout is `~/lightning`; source paths are configurable.
 Its `rust-toolchain.toml` pins Rust 1.97.0; use rustup-managed Cargo. Its output
 directory is `build/cargo_target/release`.
 
 ```sh
-cd "$HOME/Projects/lightning-main"
+cd "$HOME/lightning"
 cargo build --locked --release -p lightning
 tools/lightning/build-guest.sh /tmp/lt-meta-guest
 ```
@@ -147,7 +208,7 @@ children with each backend. Use a different, new output directory for each run.
 
 ```sh
 ./build/vm-fork-bench --backend lightning \
-  --repo "$HOME/Projects/lightning-main" \
+  --lightning-source "$HOME/lightning" \
   --kernel /tmp/lt-vmlinux --initrd /tmp/lt-meta-guest/initramfs.cpio.gz \
   --rounds 2 --forks-per-round 2 --output results/lightning-smoke
 
@@ -170,7 +231,7 @@ for backend in lightning firecracker; do
     --uid="$(id -u)" --gid="$(id -g)" \
     --property=MemoryAccounting=yes \
     "$LT_BENCH" --backend "$backend" \
-    --repo "$HOME/Projects/lightning-main" \
+    --lightning-source "$HOME/lightning" \
     --firecracker "$HOME/Projects/firecracker-baseline/build/cargo_target/release/firecracker" \
     --kernel /tmp/lt-vmlinux --initrd /tmp/lt-meta-guest/initramfs.cpio.gz \
     --rounds 50 --forks-per-round 50 --memory-mib 256 --vcpus 1 \
