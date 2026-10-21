@@ -54,6 +54,7 @@ lightning="$project/build/vmm/lightning/release/lightning"
 firecracker="$project/build/vmm/firecracker/release/firecracker"
 kernel="$project/build/guest/vmlinux"
 initrd="$project/build/guest/initramfs.cpio.gz"
+memory_mib=4096
 for executable in "$lightning" "$firecracker"; do
     [[ -x "$executable" ]] || { status=missing_dependencies; echo "Missing executable: $executable"; exit 2; }
 done
@@ -63,7 +64,7 @@ done
 make check
 ./build/vm-fork-bench --preflight --lightning "$lightning" --firecracker "$firecracker" \
     --lightning-source "$project/build/deps/lightning" --firecracker-source "$project/build/deps/firecracker" \
-    --kernel "$kernel" --initrd "$initrd" --rounds 50 --forks-per-round 50 > "$run_dir/preflight.json"
+    --kernel "$kernel" --initrd "$initrd" --memory-mib "$memory_mib" --rounds 50 --forks-per-round 50 > "$run_dir/preflight.json"
 if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     status=blocked_kvm
     echo 'KVM unavailable in this session. Run this script from a normal host terminal with /dev/kvm access.'
@@ -77,8 +78,8 @@ cgroup_mode=shared
 if command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
     cgroup_mode=isolated_user_scope
 fi
-printf '{"cgroup_mode":"%s","work_directory":"build/w","memory_mib":256,"vcpus":1,"settle_ms":200,"huge_pages":"None","firecracker_snapshot_policy":"per-fork"}\n' \
-    "$cgroup_mode" > "$run_dir/settings.json"
+printf '{"cgroup_mode":"%s","work_directory":"build/w","memory_mib":%d,"vcpus":1,"settle_ms":200,"huge_pages":"None","firecracker_snapshot_policy":"per-fork"}\n' \
+    "$cgroup_mode" "$memory_mib" > "$run_dir/settings.json"
 if [[ "$cgroup_mode" == shared ]]; then
     echo 'Using a shared cgroup: process PSS remains useful; group totals may include unrelated activity.'
 fi
@@ -87,7 +88,7 @@ for backend in lightning firecracker; do
     command=("$project/build/vm-fork-bench" --backend "$backend"
         --lightning-source "$project/build/deps/lightning" --firecracker-source "$project/build/deps/firecracker"
         --lightning "$lightning" --firecracker "$firecracker"
-        --kernel "$kernel" --initrd "$initrd" --memory-mib 256 --vcpus 1 --huge-pages None
+        --kernel "$kernel" --initrd "$initrd" --memory-mib "$memory_mib" --vcpus 1 --huge-pages None
         --rounds 50 --forks-per-round 50 --settle-ms 200 --work-dir "$project/build/w"
         --output "$run_dir/$backend")
     printf '\nStarting %s\n' "$backend"

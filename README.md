@@ -129,7 +129,12 @@ select separate source trees (defaults `~/lightning` and `~/firecracker`).
 `--firecracker BIN` for other build locations. The controller does not build sources.
 
 The runner performs 50 rounds of 50 children for each backend, sequentially,
-with 256 MiB configured RAM, one vCPU and a 200 ms settling delay. It verifies
+with 4 GiB configured RAM, one vCPU and a 200 ms settling delay. Change
+`memory_mib` in `scripts/run-full-suite.sh` to adjust the capacity for both
+backends, preflight and saved settings. The controller's standalone default
+remains 256 MiB. At 4 GiB, 50 retained snapshots represent 200 GiB of logical
+RAM files per batch; actual allocated storage depends on the filesystem.
+The runner verifies
 2,500 completions per backend and clean teardown. It uses a separate user
 systemd scope per backend when available, and records shared-cgroup fallback
 explicitly. Results live under `results/full-suite/run-*`, with `latest` pointing
