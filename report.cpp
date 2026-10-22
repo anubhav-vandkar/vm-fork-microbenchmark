@@ -141,7 +141,39 @@ void collect_snapshot_series(const Object& metadata, Series& series) {
     if (const auto value = metadata.if_contains("snapshot_memory_bytes")) series["snapshot_memory_file"].push_back(integer(*value) / 1048576.0);
     if (const auto value = metadata.if_contains("snapshot_state_bytes")) series["snapshot_state_file"].push_back(integer(*value));
     if (const auto value = metadata.if_contains("snapshot_allocated_bytes")) series["snapshot_allocated_file"].push_back(integer(*value) / 1048576.0);
+    if (const auto value = metadata.if_contains("capture_ns")) series["snapshot_capture_ms"].push_back(integer(*value) / 1e6);
+    if (const auto value = metadata.if_contains("backing_copy_ns")) series["snapshot_backing_copy_ms"].push_back(integer(*value) / 1e6);
+    if (const auto value = metadata.if_contains("base_allocated_bytes")) series["snapshot_base_allocated_mib"].push_back(integer(*value) / 1048576.0);
 }
+
+struct DiffAudit {
+    int64_t initial = 0, reflinks = 0, sparse_copies = 0;
+    std::string base;
+    void observe(const Object& metadata, int64_t preparation, int64_t fork) {
+        require(metadata.at("track_dirty_pages").as_bool(), "Diff snapshot lacks KVM dirty tracking");
+        int64_t components = 0;
+        for (const auto* field : {"capture_ns", "backing_copy_ns"}) {
+            const auto value = integer(metadata.at(field));
+            require(value >= 0 && value <= preparation - components, "Invalid diff preparation components");
+            components += value;
+        }
+        require(metadata.at("initial_base").as_bool() == (fork == 1), "Diff base must be initialized exactly at the first fork");
+        initial += metadata.at("initial_base").as_bool();
+        const auto path = text(metadata.at("base_memory_path"));
+        require(!path.empty() && path != text(metadata.at("snapshot_memory_path")) && (base.empty() || base == path),
+            "Diff cumulative base was replaced or used as live child backing");
+        base = path;
+        const auto length = integer(metadata.at("snapshot_memory_bytes"));
+        require(metadata.at("merge_in_capture").as_bool() && !metadata.at("child_track_dirty_pages").as_bool(), "Invalid native diff merge/child tracking metadata");
+        require(length > 0 && integer(metadata.at("base_memory_bytes")) == length, "Diff base and child backing sizes disagree");
+        const auto allocated = integer(metadata.at("base_allocated_bytes"));
+        require(allocated >= 0 && allocated <= length, "Invalid diff allocation metadata");
+        const auto method = text(metadata.at("snapshot_copy_method"));
+        require(method == "reflink" || method == "sparse-copy", "Invalid diff backing copy method");
+        reflinks += method == "reflink";
+        sparse_copies += method == "sparse-copy";
+    }
+};
 
 void collect_batch_series(const Object& sample, double baseline, int64_t children, Series& series) {
     const auto pss = integer(sample.at("memory_sum_kib").as_object().at("Pss")) / 1024.0;
@@ -204,8 +236,14 @@ const std::vector<ReportRow> report_rows = {
     {"Guest ready median / p95 (ms)", "guest_ready_median_ms", "guest_ready_p95_ms"},
     {"Snapshot preparation median (ms)", "snapshot_preparation_median"},
     {"Snapshot preparations", "snapshot_preparations"},
+    {"Snapshot mode", "snapshot_type"},
     {"Snapshot RAM file, median (MiB)", "snapshot_memory_file_median"},
-    {"Snapshot allocated file, median (MiB)", "snapshot_allocated_file_median"},
+    {"Child backing allocated, median (MiB)", "snapshot_allocated_file_median"},
+    {"Cumulative base allocation, max (MiB)", "snapshot_base_allocated_mib_max"},
+    {"Snapshot capture incl. native merge, median (ms)", "snapshot_capture_ms_median"},
+    {"Backing copy median (ms)", "snapshot_backing_copy_ms_median"},
+    {"Initial base snapshots", "initial_base_snapshots"},
+    {"Reflink / sparse child copies", "reflink_copies", "sparse_copies"},
     {"Snapshot state file, median (bytes)", "snapshot_state_file_median"},
     {"Measured duration (seconds)", "elapsed_seconds"},
     {"Cgroup CPU time (seconds)", "cgroup_cpu_seconds"},
@@ -213,6 +251,7 @@ const std::vector<ReportRow> report_rows = {
 };
 
 std::string row_value(const Object& result, const ReportRow& row) {
+    if (std::string(row.key) == "snapshot_type") return text(result.at("snapshot_type"));
     if (std::string(row.key) == "snapshot_preparation_median" && text(result.at("backend")) == "lightning") return "Not used (live fork)";
     const auto value = display_number(result, row.key);
     return row.second ? value + " / " + display_number(result, row.second) : value;
@@ -237,6 +276,11 @@ Object analyze_saved_backend(const fs::path& directory) {
     require(firecracker ? snapshot_policy == "per-fork" || snapshot_policy == "per-round" : snapshot_policy == "live-fork",
         "Unsupported saved snapshot policy");
     const bool fresh = firecracker && snapshot_policy == "per-fork";
+    const auto type = summary.if_contains("snapshot_type");
+    const std::string snapshot_type = type ? text(*type) : firecracker ? "full" : "none";
+    require(firecracker ? snapshot_type == "full" || snapshot_type == "diff" : snapshot_type == "none", "Invalid saved snapshot type");
+    const bool diff = snapshot_type == "diff";
+    if (diff) require(fresh && summary.at("track_dirty_pages").as_bool(), "Diff mode requires per-fork KVM dirty tracking");
     if (fresh) require(summary.at("creation_timing_includes_preparation").as_bool(), "Fresh snapshots must be included in creation timing");
     const auto rounds = integer(settings.at("rounds")), children = integer(settings.at("forks_per_round"));
     require(rounds > 0 && rounds <= 1000 && children > 0 && children <= 1000, "Invalid saved workload");
@@ -247,6 +291,7 @@ Object analyze_saved_backend(const fs::path& directory) {
     require(bool(input), "Cannot read saved raw samples");
     Statistics statistics;
     Series series;
+    DiffAudit diff_audit;
     Object first, last;
     int64_t count = 0;
     double baseline = 0;
@@ -277,6 +322,9 @@ Object analyze_saved_backend(const fs::path& directory) {
                 require(!state.empty() && !memory.empty() && state != memory &&
                     snapshot_states.insert(state).second && snapshot_memories.insert(memory).second,
                     "Per-fork snapshot files were reused");
+                const auto child_type = metadata.if_contains("snapshot_type");
+                require((child_type ? text(*child_type) : "full") == snapshot_type, "Mixed snapshot modes in saved run");
+                if (diff) diff_audit.observe(metadata, preparation, integer(sample.at("fork_number")));
                 collect_snapshot_series(metadata, series);
             }
             batch_creation_ns += elapsed;
@@ -302,6 +350,8 @@ Object analyze_saved_backend(const fs::path& directory) {
     require(!input.bad() && count == 3 + rounds * (children + 3), "Incomplete saved lifecycle samples");
     const auto preparations = series.contains("snapshot_preparation") ? static_cast<int64_t>(series.at("snapshot_preparation").size()) : 0;
     require(preparations == (firecracker ? fresh ? rounds * children : rounds : 0), "Snapshot preparation count disagrees with policy");
+    if (diff) require(diff_audit.initial == 1 && diff_audit.reflinks + diff_audit.sparse_copies == rounds * children,
+        "Incomplete diff base/copy audit");
     const auto metrics = statistics.report();
     require(metrics == summary.at("metrics").as_object(), "Saved summary statistics disagree with raw samples");
     Object result{{"backend", summary.at("backend")}, {"status", "ok"}, {"lifecycle_audit", "passed"}, {"samples", count}, {"rounds_completed", rounds},
@@ -312,6 +362,8 @@ Object analyze_saved_backend(const fs::path& directory) {
         {"guest_ready_median_ms", integer(metrics.at("guest_ready_median_ns")) / 1e6},
         {"guest_ready_p95_ms", integer(metrics.at("guest_ready_p95_ns")) / 1e6},
         {"snapshot_policy", snapshot_policy}, {"snapshot_preparations", preparations},
+        {"snapshot_type", snapshot_type}, {"track_dirty_pages", diff},
+        {"initial_base_snapshots", diff_audit.initial}, {"reflink_copies", diff_audit.reflinks}, {"sparse_copies", diff_audit.sparse_copies},
         {"combined_creation_total_ms", total_creation_ns / 1e6},
         {"amortized_creation_mean_ms", total_creation_ns / 1e6 / (rounds * children)},
         {"elapsed_seconds", (integer(last.at("monotonic_ns")) - integer(first.at("monotonic_ns"))) / 1e9}};
@@ -355,7 +407,9 @@ void generate_saved_report(const fs::path& directory, const fs::path& dashboard_
         const auto debugfs = lightning.at("kvm_debugfs_available").as_bool() && firecracker.at("kvm_debugfs_available").as_bool()
             ? "Available" : "Unavailable (not collected or permission denied)";
         const bool fresh = text(firecracker.at("snapshot_policy")) == "per-fork";
-        const std::string policy_label = fresh ? "fresh full snapshot before every child" : "one shared snapshot per round (historical policy)";
+        const bool diff = text(firecracker.at("snapshot_type")) == "diff";
+        const std::string policy_label = fresh ? diff ? "fresh KVM dirty-page diff before every child" : "fresh full snapshot before every child"
+            : "one shared snapshot per round (historical policy)";
         auto dashboard = read_text(dashboard_template);
         replace_token(dashboard, "{{rows}}", html_rows.str());
         replace_token(dashboard, "{{rounds}}", display_number(workload, "rounds"));
@@ -380,6 +434,10 @@ void generate_saved_report(const fs::path& directory, const fs::path& dashboard_
                  << "Both raw streams passed complete lifecycle ordering, live-count and completion checks; final live VMs are zero. "
                  << "Original summaries, raw samples, process logs and launcher status are preserved. The historical launcher failure, "
                  << "if present, is distinct from this successful reporting pass.\n";
+        if (diff) markdown << "\nThe first diff of the booted parent forms a sparse cumulative base. Firecracker merges every later diff directly into that private base, "
+            "then reflinked or copied sparsely into immutable child backing. The base is never mapped by a child. "
+            "Capture includes native merging; capture, backing-copy and synchronization costs are included in preparation and guest readiness exactly once. "
+            "The initial base is charged to the first child. Allocated bytes use stat blocks and are not unique physical bytes when reflinks share extents.\n";
         write_text(directory / "comparison.json", json::serialize(comparison) + "\n");
         write_text(directory / "report.md", markdown.str());
         write_text(directory / "dashboard.html", dashboard);

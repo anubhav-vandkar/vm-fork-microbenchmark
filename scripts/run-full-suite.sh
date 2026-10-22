@@ -30,7 +30,11 @@ if [[ "${1:-}" == --verify-only ]]; then
     echo 'Verified both saved VM runs: 2,500 child creations each, 50 batches, clean final teardown.'
     return 0
 fi
-mkdir -p build/tmp build/w results/full-suite
+snapshot_type=${VM_BENCH_SNAPSHOT_TYPE:-diff}
+work_dir=${VM_BENCH_WORK_DIR:-"$project/build/w"}
+[[ "$snapshot_type" == full || "$snapshot_type" == diff ]] || { echo 'VM_BENCH_SNAPSHOT_TYPE must be full or diff.' >&2; return 2; }
+mkdir -p build/tmp "$work_dir" results/full-suite
+work_dir=$(cd -- "$work_dir" && pwd -P)
 export TMPDIR="$project/build/tmp" CCACHE_DISABLE=1
 exec 9>build/full-suite.lock
 flock -n 9 || { echo 'Another full-suite run is active.' >&2; exit 1; }
@@ -49,7 +53,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 printf 'Results: %s\n' "$run_dir"
 printf 'Workload: 50 rounds x 50 children per backend; maximum 51 live VMs.\n'
-printf 'Firecracker: fresh synchronized full snapshot before every child; preparation included in creation timing.\n'
+printf 'Firecracker: fresh synchronized %s snapshot before every child; capture/merge/copy included in creation timing.\n' "$snapshot_type"
+printf 'Snapshot/socket directory: %s\n' "$work_dir"
 lightning="$project/build/vmm/lightning/release/lightning"
 firecracker="$project/build/vmm/firecracker/release/firecracker"
 kernel="$project/build/guest/vmlinux"
@@ -64,7 +69,8 @@ done
 make check
 ./build/vm-fork-bench --preflight --lightning "$lightning" --firecracker "$firecracker" \
     --lightning-source "$project/build/deps/lightning" --firecracker-source "$project/build/deps/firecracker" \
-    --kernel "$kernel" --initrd "$initrd" --memory-mib "$memory_mib" --rounds 50 --forks-per-round 50 > "$run_dir/preflight.json"
+    --kernel "$kernel" --initrd "$initrd" --memory-mib "$memory_mib" --snapshot-type "$snapshot_type" \
+    --work-dir "$work_dir" --rounds 50 --forks-per-round 50 > "$run_dir/preflight.json"
 if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     status=blocked_kvm
     echo 'KVM unavailable in this session. Run this script from a normal host terminal with /dev/kvm access.'
@@ -78,8 +84,11 @@ cgroup_mode=shared
 if command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
     cgroup_mode=isolated_user_scope
 fi
-printf '{"cgroup_mode":"%s","work_directory":"build/w","memory_mib":%d,"vcpus":1,"settle_ms":200,"huge_pages":"None","firecracker_snapshot_policy":"per-fork"}\n' \
-    "$cgroup_mode" "$memory_mib" > "$run_dir/settings.json"
+jq -n --arg cgroup_mode "$cgroup_mode" --arg work_directory "$work_dir" --arg snapshot_type "$snapshot_type" \
+    --argjson memory_mib "$memory_mib" \
+    '{cgroup_mode:$cgroup_mode,work_directory:$work_directory,memory_mib:$memory_mib,vcpus:1,settle_ms:200,huge_pages:"None",
+      firecracker_snapshot_policy:"per-fork",firecracker_snapshot_type:$snapshot_type,firecracker_dirty_tracking:($snapshot_type=="diff")}' \
+    > "$run_dir/settings.json"
 if [[ "$cgroup_mode" == shared ]]; then
     echo 'Using a shared cgroup: process PSS remains useful; group totals may include unrelated activity.'
 fi
@@ -89,7 +98,7 @@ for backend in lightning firecracker; do
         --lightning-source "$project/build/deps/lightning" --firecracker-source "$project/build/deps/firecracker"
         --lightning "$lightning" --firecracker "$firecracker"
         --kernel "$kernel" --initrd "$initrd" --memory-mib "$memory_mib" --vcpus 1 --huge-pages None
-        --rounds 50 --forks-per-round 50 --settle-ms 200 --work-dir "$project/build/w"
+        --snapshot-type "$snapshot_type" --rounds 50 --forks-per-round 50 --settle-ms 200 --work-dir "$work_dir"
         --output "$run_dir/$backend")
     printf '\nStarting %s\n' "$backend"
     runner=("${command[@]}")

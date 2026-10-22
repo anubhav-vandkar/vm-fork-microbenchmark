@@ -24,7 +24,11 @@ A helper does not need its own source/header pair.
   private to that file. `ProcessManager` centralizes pidfd tracking and reaping.
   Firecracker's clone operation owns fresh snapshot preparation and restore;
   a child-ID map retains its backing paths until the child process has stopped.
-  The enclosing temporary directory removes partial files after failed creation.
+  Diff mode uses native Firecracker merging into a private cumulative base,
+  followed by immutable child reflinks or sparse copies. File extents and fsync
+  belong to this VM mechanism; no external merging executable is invoked.
+  Failure cleanup removes partial files after process termination, and removes
+  the cumulative base before final accounting. The temporary directory is a fallback.
 - Protocol clients do not know the round count or measurement schema.
 - Measurement readers do not create or destroy VMs. Reporting consumes samples.
 - `--report-only` dispatches before host/KVM checks or backend construction. It
@@ -32,7 +36,8 @@ A helper does not need its own source/header pair.
   agreement, and regenerates the comparison, report and dashboard. A separate
   reporting status preserves the historical launcher status and raw inputs.
   Policy-aware analysis counts fresh preparations per child without adding them
-  twice, rejects reused paths, and preserves legacy per-round timing boundaries.
+  twice, audits diff initial-base/copy metadata, rejects mixed types/reused child
+  paths, and preserves legacy full/per-round timing boundaries.
 - Descriptors and temporary resources use RAII.
 - Boost.JSON definitions are compiled once in `transport.cpp`.
 - Tests link into a separate executable. `--self-test` delegates to it.
@@ -50,4 +55,6 @@ readers, KVM PID matching, CSV schema, statistics, CLI parsing, HTTP formatting,
 JSON round trips, Unix-socket framing and native process cleanup. They validate
 the controller, not real VM performance. A simulated HTTP API exercises the real
 Firecracker backend's pause/capture/resume sequence, unique backing retention,
-normal teardown and failed-restore cleanup. Saved fixtures test both timing policies.
+normal teardown, sparse zero/hole semantics, history across rounds, child backing
+immutability, dirty tracking on boot and failed-capture/restore cleanup. Saved
+fixtures test full/diff/legacy timing and reject invalid diff metadata.

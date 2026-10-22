@@ -1,5 +1,6 @@
 #include "benchmark.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <iostream>
@@ -10,6 +11,8 @@
 #include <utility>
 #include <vector>
 #include <sstream>
+#include <thread>
+#include <sys/stat.h>
 
 
 
@@ -211,6 +214,10 @@ void test_cli_options() {
         sources.firecracker == "/server/firecracker/build/cargo_target/release/firecracker", "Source directories are not independent");
     const auto binaries = parse({"benchmark", "--repo", "/old/lightning", "--firecracker-source", "/server/fc", "--firecracker", "/custom/fc"});
     require(binaries.repo == "/old/lightning" && binaries.firecracker == "/custom/fc", "Legacy source alias or binary override changed");
+    require(options.snapshot_type == "diff" && parse({"benchmark", "--snapshot-type", "full"}).snapshot_type == "full", "Snapshot mode defaults/override changed");
+    bool rejected = false;
+    try { parse({"benchmark", "--snapshot-type", "invalid"}); } catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "Invalid snapshot mode accepted");
     try { parse({"benchmark", "--rounds", "4invalid"}); }
     catch (const std::runtime_error&) { return; }
     throw std::runtime_error("Malformed integer option accepted");
@@ -330,6 +337,55 @@ void test_saved_report() {
     require(integer(comparison.at("vm_runs_started")) == 0 &&
         comparison.at("backends").as_object().at("firecracker").as_object().at("amortized_creation_mean_ms").as_double() == 25.0,
         "Report generation changed fresh snapshot timing");
+
+    summary["snapshot_type"] = "diff";
+    summary["track_dirty_pages"] = true;
+    std::vector<Object> diff_samples;
+    std::istringstream diff_input(raw.str());
+    while (std::getline(diff_input, line)) diff_samples.push_back(json::parse(line).as_object());
+    auto& metadata = diff_samples[3]["extra"].as_object()["backend_metadata"].as_object();
+    metadata["snapshot_type"] = "diff";
+    metadata["track_dirty_pages"] = true;
+    metadata["capture_ns"] = 3000000;
+    metadata["backing_copy_ns"] = 4000000;
+    metadata["initial_base"] = true;
+    metadata["base_memory_path"] = "base";
+    metadata["snapshot_memory_bytes"] = 4194304;
+    metadata["base_memory_bytes"] = 4194304;
+    metadata["base_allocated_bytes"] = 8192;
+    metadata["merge_in_capture"] = true;
+    metadata["child_track_dirty_pages"] = false;
+    metadata["snapshot_copy_method"] = "sparse-copy";
+    auto save_diff = [&] {
+        std::ostringstream stream;
+        for (const auto& sample : diff_samples) stream << json::serialize(sample) << '\n';
+        write_text(fc / "samples.jsonl", stream.str());
+        write_text(fc / "summary.json", json::serialize(summary));
+    };
+    save_diff();
+    generate_saved_report(temporary.path(), project / "templates/results-dashboard.html");
+    const auto diff_result = analyze_saved_backend(fc);
+    require(diff_result.at("amortized_creation_mean_ms").as_double() == 25.0 && integer(diff_result.at("initial_base_snapshots")) == 1 &&
+        integer(diff_result.at("sparse_copies")) == 1 && diff_result.at("snapshot_base_allocated_mib_median").as_double() == 8192.0 / 1048576 &&
+        diff_result.at("snapshot_capture_ms_median").as_double() == 3.0 && diff_result.at("snapshot_backing_copy_ms_median").as_double() == 4.0 &&
+        read_text(temporary.path() / "dashboard.html").find("fresh KVM dirty-page diff") != std::string::npos,
+        "Diff report timing, allocations, base/copy counts or mode label are incorrect");
+    auto reject_diff = [&] {
+        save_diff();
+        try { analyze_saved_backend(fc); } catch (const std::exception&) { return; }
+        throw std::runtime_error("Invalid saved diff metadata accepted");
+    };
+    metadata["track_dirty_pages"] = false;
+    reject_diff();
+    metadata["track_dirty_pages"] = true;
+    metadata["initial_base"] = false;
+    reject_diff();
+    metadata["initial_base"] = true;
+    metadata["base_memory_path"] = "m1";
+    reject_diff();
+    metadata["base_memory_path"] = "base";
+    metadata["capture_ns"] = 20000000;
+    reject_diff();
 }
 void test_incomplete_report() {
     TemporaryDirectory temporary(fs::temp_directory_path());
@@ -422,6 +478,78 @@ void test_combined_creation_timing() {
 }
 
 namespace vmbench::tests {
+namespace {
+void write_page(const fs::path& path, std::streamoff offset, char value) {
+    std::fstream output(path, std::ios::binary | std::ios::in | std::ios::out);
+    require(bool(output), "Cannot open fixture memory");
+    output.seekp(offset);
+    output << std::string(4096, value);
+    require(bool(output), "Cannot write fixture memory");
+}
+std::string read_page(const fs::path& path, std::streamoff offset) {
+    std::ifstream input(path, std::ios::binary);
+    input.seekg(offset);
+    std::string page(4096, '\0');
+    input.read(page.data(), page.size());
+    require(bool(input), "Cannot read fixture memory");
+    return page;
+}
+void make_diff_fixture(const fs::path& path, int capture) {
+    if (capture == 1) {
+        write_text(path, "");
+        fs::resize_file(path, 4 * 1024 * 1024);
+        write_page(path, 0, 'A'); write_page(path, 8192, 'P');
+    }
+    else if (capture == 2) { write_page(path, 0, '\0'); write_page(path, 65536, 'B'); }
+    else write_page(path, 131072, 'C');
+}
+
+void start_fake_guest(const fs::path& path, const std::shared_ptr<std::atomic<int>>& counter) {
+    FileDescriptor server(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    require(path.string().size() < sizeof(address.sun_path), "Fake guest path too long");
+    std::strcpy(address.sun_path, path.c_str());
+    require(bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 && listen(server.get(), 4) == 0,
+        "Cannot bind fake guest socket");
+    std::thread([server = std::move(server), counter] {
+        try {
+            for (;;) {
+                FileDescriptor client(accept4(server.get(), nullptr, nullptr, SOCK_CLOEXEC));
+                require(client.get() >= 0 && read_line(client.get()) == "CONNECT 5000", "Fake guest connection failed");
+                send_all(client.get(), "OK 5000\n");
+                const auto command = read_line(client.get());
+                if (command.starts_with("SET ")) counter->store(std::stoi(command.substr(4)));
+                send_all(client.get(), json::serialize(Object{{"counter", counter->load()}, {"allocated", 0}}) + "\n");
+            }
+        } catch (...) { _exit(2); }
+    }).detach();
+}
+}
+
+void test_sparse_diff_memory() {
+    TemporaryDirectory temporary(fs::temp_directory_path());
+    const auto base = temporary.path() / "base";
+    make_diff_fixture(base, 1);
+    for (const bool allow_reflink : {false, true}) {
+        make_diff_fixture(base, 1);
+        const auto copy = temporary.path() / (allow_reflink ? "auto" : "sparse");
+        const auto method = copy_snapshot_memory(base, copy, allow_reflink);
+        require(method == "sparse-copy" || (allow_reflink && method == "reflink"), "Incorrect backing-copy method");
+        make_diff_fixture(base, 2);
+        require(read_page(base, 0) == std::string(4096, '\0') && read_page(base, 8192) == std::string(4096, 'P') &&
+            read_page(base, 65536) == std::string(4096, 'B'), "Diff zero/unchanged/new-page reconstruction failed");
+        require(read_page(copy, 0) == std::string(4096, 'A') && read_page(copy, 8192) == std::string(4096, 'P') &&
+            read_page(copy, 65536) == std::string(4096, '\0'), "Updating cumulative base corrupted earlier child memory");
+        struct stat metadata{};
+        require(stat(copy.c_str(), &metadata) == 0 && uint64_t(metadata.st_blocks) * 512 < fs::file_size(copy) / 4,
+            "Child memory copy inflated sparse holes");
+    }
+    bool rejected = false;
+    try { copy_snapshot_memory(base, temporary.path() / "sparse"); } catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "Existing child backing was overwritten");
+}
+
 // Local API simulator: exercises the real backend's request order and file ownership.
 int fake_firecracker(const fs::path& socket_path) {
     FileDescriptor server(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
@@ -432,7 +560,9 @@ int fake_firecracker(const fs::path& socket_path) {
     std::strcpy(address.sun_path, socket_path.c_str());
     require(bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 && listen(server.get(), 4) == 0,
         "Fake API bind/listen failed");
-    bool paused = false;
+    bool paused = false, tracking = false;
+    int captures = 0;
+    auto counter = std::make_shared<std::atomic<int>>(0);
     for (;;) {
         FileDescriptor client(accept4(server.get(), nullptr, nullptr, SOCK_CLOEXEC));
         require(client.get() >= 0, "Fake API accept failed");
@@ -452,16 +582,31 @@ int fake_firecracker(const fs::path& socket_path) {
         const auto body = json::parse(payload).as_object();
         bool fail = false;
         if (request.starts_with("PATCH /vm ")) paused = text(body.at("state")) == "Paused";
+        else if (request.starts_with("PUT /machine-config ")) tracking = body.at("track_dirty_pages").as_bool();
+        else if (request.starts_with("PUT /vsock ")) start_fake_guest(text(body.at("uds_path")), counter);
+        else if (request.starts_with("PUT /boot-source ") || request.starts_with("PUT /actions ")) { /* Boot fixture. */ }
         else if (request.starts_with("PUT /snapshot/create ")) {
-            require(paused && text(body.at("snapshot_type")) == "Full" && body.at("sync_snapshot_files").as_bool(), "Snapshot was not paused/full/synchronized");
-            require(!fs::exists(text(body.at("snapshot_path"))) && !fs::exists(text(body.at("mem_file_path"))), "Snapshot file was reused");
-            write_text(text(body.at("snapshot_path")), "cpu and devices");
-            write_text(text(body.at("mem_file_path")), "guest ram");
+            const auto type = text(body.at("snapshot_type"));
+            require(paused && (type == "Full" || (type == "Diff" && tracking)) && body.at("sync_snapshot_files").as_bool(),
+                "Snapshot was not paused/synchronized or dirty tracking was disabled");
+            const auto memory = fs::path(text(body.at("mem_file_path")));
+            require(!fs::exists(text(body.at("snapshot_path"))) && (type == "Diff" || !fs::exists(memory)), "Snapshot state or full memory file was reused");
+            write_text(text(body.at("snapshot_path")), json::serialize(Object{{"counter", counter->load()}}));
+            if (type == "Diff") {
+                require(memory.filename() == "base.mem" && (fs::exists(memory) == (captures > 0)), "Diff did not update its cumulative base");
+                make_diff_fixture(memory, ++captures);
+            }
+            else write_text(text(body.at("mem_file_path")), "guest ram");
+            fail = fs::exists(socket_path.string() + ".fail-capture");
         } else if (request.starts_with("PUT /snapshot/load ")) {
             require(fs::is_regular_file(text(body.at("snapshot_path"))) &&
                 fs::is_regular_file(text(body.at("mem_backend").as_object().at("backend_path"))) &&
-                body.at("resume_vm").as_bool(), "Restore backing is missing");
+                body.at("resume_vm").as_bool() && !body.at("track_dirty_pages").as_bool(), "Restore backing is missing or child dirty tracking was enabled");
             fail = fs::exists(socket_path.string() + ".fail");
+            if (!fail) {
+                counter->store(static_cast<int>(integer(json::parse(read_text(text(body.at("snapshot_path")))).as_object().at("counter"))));
+                start_fake_guest(text(body.at("vsock_override").as_object().at("uds_path")), counter);
+            }
         } else throw std::runtime_error("Unexpected fake API request");
         std::ofstream trace(socket_path.string() + ".trace", std::ios::app);
         trace << json::serialize(Object{{"request", request}, {"body", body}}) << '\n';
@@ -480,6 +625,7 @@ void test_firecracker_fresh_snapshots() {
     auto root = parent.track(0, pid, control, {});
     Options options;
     options.backend = "firecracker";
+    options.snapshot_type = "full";
     options.firecracker = executable;
     options.output = temporary.path();
     auto backend = make_backend(options, temporary.path());
@@ -511,6 +657,55 @@ void test_firecracker_fresh_snapshots() {
         "Failed restore did not clean child and backing");
     parent.stop(root, SIGTERM);
 }
+
+void test_firecracker_diff_snapshots() {
+    TemporaryDirectory temporary(fs::temp_directory_path());
+    Options options;
+    options.backend = "firecracker";
+    options.firecracker = fs::read_symlink("/proc/self/exe");
+    options.output = temporary.path();
+    auto backend = make_backend(options, temporary.path());
+    auto root = backend->boot();
+    backend->marker(root, 1);
+    auto first = backend->clone(root, 1);
+    backend->marker(root, 2);
+    auto second = backend->clone(root, 2);
+    const auto first_memory = text(first.metadata.at("snapshot_memory_path"));
+    const auto second_memory = text(second.metadata.at("snapshot_memory_path"));
+    require(integer(backend->ready(first.child).at("counter")) == 1 && integer(backend->ready(second.child).at("counter")) == 2,
+        "Diff children did not inherit their own point-in-time state");
+    require(read_page(first_memory, 0) == std::string(4096, 'A') && read_page(second_memory, 0) == std::string(4096, '\0') &&
+        read_page(second_memory, 8192) == std::string(4096, 'P') && read_page(second_memory, 65536) == std::string(4096, 'B'),
+        "Diff restore lost base pages, zero writes, or earlier child isolation");
+    require(first.metadata.at("initial_base").as_bool() && !second.metadata.at("initial_base").as_bool() &&
+        integer(second.metadata.at("prepare_ns")) >= integer(second.metadata.at("capture_ns")) +
+            integer(second.metadata.at("backing_copy_ns")), "Diff initial-base or preparation accounting failed");
+    backend->destroy(first.child);
+    backend->destroy(second.child);
+    backend->release_round(root);
+    require(fs::exists(temporary.path() / "base.mem"), "Cumulative base lost between rounds");
+    backend->marker(root, 3);
+    auto third = backend->clone(root, 3);
+    const auto third_memory = text(third.metadata.at("snapshot_memory_path"));
+    require(!third.metadata.at("initial_base").as_bool() && read_page(third_memory, 8192) == std::string(4096, 'P') &&
+        read_page(third_memory, 65536) == std::string(4096, 'B') && read_page(third_memory, 131072) == std::string(4096, 'C'),
+        "Diff reconstruction did not retain history across rounds");
+    write_text(temporary.path() / "f4.sock.fail", "fail restore");
+    bool failed = false;
+    try { backend->clone(root, 4); } catch (const std::runtime_error&) { failed = true; }
+    require(failed && backend->cleanup().empty() && !root->alive && !third.child->alive &&
+        !fs::exists(third_memory) && !fs::exists(temporary.path() / "base.mem") && !fs::exists(temporary.path() / "c4.mem"),
+        "Diff failed-restore cleanup left a VM or backing memory");
+
+    auto retry = make_backend(options, temporary.path());
+    // The process/socket IDs are reusable after cleanup; force capture failure before child launch.
+    root = retry->boot();
+    write_text(root->control.string() + ".fail-capture", "fail capture");
+    failed = false;
+    try { retry->clone(root, 5); } catch (const std::runtime_error&) { failed = true; }
+    require(failed && retry->cleanup().empty() && !fs::exists(temporary.path() / "base.mem") && !fs::exists(temporary.path() / "c5.state"),
+        "Capture failure left partial diff files");
+}
 }
 
 int main(int argc, char** argv) {
@@ -528,7 +723,9 @@ int main(int argc, char** argv) {
         {"Unix-socket framing", test_socket_framing}, {"native process cleanup", test_process_cleanup},
         {"saved-result reporting", test_saved_report}, {"incomplete report rejection", test_incomplete_report},
         {"combined creation timing", test_combined_creation_timing},
-        {"Firecracker per-fork snapshots and cleanup (simulated API)", test_firecracker_fresh_snapshots}
+        {"Firecracker per-fork snapshots and cleanup (simulated API)", test_firecracker_fresh_snapshots},
+        {"sparse backing copies and base-update isolation", test_sparse_diff_memory},
+        {"Firecracker diff lifecycle and failures (simulated API)", test_firecracker_diff_snapshots}
     };
     int passed = 0, skipped = 0, failed = 0;
     for (const auto& [name, run] : tests) {

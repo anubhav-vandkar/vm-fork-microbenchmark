@@ -21,25 +21,39 @@ repeated over 50 rounds?** Compare the same fields for Lightning and Firecracker
 | Batch destruction elapsed time | Controller | Time to shut down/reap children and release snapshot backing |
 | FC snapshot state bytes | Snapshot file size | Serialized CPU/device state size; includes userspace state, not live KVM allocation bytes |
 | FC snapshot RAM logical/allocated bytes | `stat` | Storage/backing cost; actual resident cache can differ |
-| Snapshot preparation time and count | Controller | One fresh synchronized full snapshot per child; duration is a component of guest readiness |
+| Snapshot preparation time and count | Controller | One fresh synchronized diff or full snapshot per child; duration is a component of guest readiness |
 | Snapshot policy and unique backing paths | Run summary and per-child metadata | Audit that no snapshot was reused |
+| Snapshot type / parent dirty tracking | Summary and per-child metadata | Distinguish KVM dirty-page diff mode from full mode; children have dirty tracking disabled |
+| Capture and backing-copy durations | Controller | Capture includes Firecracker's native in-place merge; copy includes synchronization |
+| Cumulative base logical/allocated bytes | `stat` | Base remains private to snapshot creation and is never loaded by children |
+| Initial base flag and copy strategy | Controller | First diff seeds the base; subsequent ones update it; reflink or sparse-copy freezes child state |
 | Combined creation time, mean | Sum raw child readiness durations, divide by completed children | Every child timer already includes its preparation; excludes settling, sampling, parent boot and cleanup |
 
 The raw cgroup CPU/IO counters are also saved as context; they include controller
 work in a shared group. They do not identify individual kernel objects.
 
 The Firecracker child timer starts before pausing the parent and ends after the
-restored guest answers the readiness check. It includes full snapshot creation,
-synchronization, parent resume, child process launch and restore. There are 2,500
+restored guest answers the readiness check. It includes diff/full snapshot capture,
+native diff merging when selected, synchronization, parent resume, immutable
+backing copy, child process launch and restore. There are 2,500
 preparations for 2,500 children. Preparation remains separately observable, but
 must not be added again to the child timer. Lightning's timer covers live fork
 and readiness. Compute means from raw durations rather than component medians.
-At most 50 distinct RAM snapshot files remain live in a batch; file cache and
-sharing differ from the historical shared-snapshot workload.
+At most 50 child RAM files remain live in a batch. Diff mode additionally retains
+one cumulative base across rounds, deleted before the final `all_stopped` sample.
+Base creation belongs to the first child's timer, so the existing raw-duration mean
+includes it exactly once. `capture_ns` includes native merging; there is no separately
+measured merge component to add. Allocated bytes are cumulative base/child allocations,
+not the number of dirty pages in one capture. That count is not exposed by this API.
+Reflinked extents can be shared, so summing stat blocks does not measure unique
+physical disk allocation. Sparse logical size is not allocated RAM or disk usage.
 
 Old saved runs without a policy field are treated as historical per-round reuse:
 their combined mean adds the measured round preparations to child durations.
 Reports retain this label and never extrapolate fresh-snapshot measurements.
+Saved per-fork runs without a snapshot type are treated as full mode. Diff reports
+validate KVM dirty tracking, one initial base, matching base/backing sizes, component
+timing bounds, unique child paths and consistent copy mode before producing results.
 
 ## Minimal KVM metadata — no broad kernel profiling
 

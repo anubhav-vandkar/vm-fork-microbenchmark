@@ -17,9 +17,13 @@ Before marking any C++ code change complete:
 The intended workload is one persistent parent, 50 rounds of 50 sequentially
 created children, with all 50 children retained for measurement and destroyed
 before the next round. There is no added guest memory buffer.
-Firecracker must create a fresh synchronized full snapshot before every child,
+Firecracker must create a fresh synchronized snapshot before every child,
 inside the per-child creation timer. Keep each child's backing until its exit.
 Count preparation once per child; never add it twice or relabel old per-round runs.
+Default to KVM dirty-page diffs, with full mode selectable. The cumulative base
+must never back a running child: native in-place diff updates are followed by
+immutable reflink/sparse child copies. Include all copy/sync work in preparation,
+charge initial base creation to the first child, and delete the base at final cleanup.
 
 Keep kernel-side collection limited to KVM-related accounting and counters unless
 the user explicitly requests broader profiling.

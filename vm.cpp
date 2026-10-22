@@ -1,12 +1,15 @@
 #include "benchmark.hpp"
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <poll.h>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <thread>
@@ -45,13 +48,17 @@ public:
     CloneResult clone(const VmHandle& root, int id) override;
     void destroy(const VmHandle& vm) override;
     void release_round(const VmHandle& root) override;
+    json::array cleanup() override;
 private:
     struct SnapshotFiles { fs::path state, memory; };
     VmHandle start_process(int id);
     void capture_snapshot(const VmHandle& root, const SnapshotFiles& files);
+    Object prepare_snapshot(const VmHandle& root, const SnapshotFiles& files);
     Object snapshot_metadata(const SnapshotFiles& files, uint64_t elapsed_ns) const;
+    void remove_snapshot_files(const SnapshotFiles& files) const;
     void remove_socket_files(const VmHandle& vm) const;
     std::map<int, SnapshotFiles> snapshots_;
+    fs::path base_;
 };
 Object guest_configuration(const Options& options, const fs::path& vsock);
 }
@@ -286,6 +293,69 @@ void LightningBackend::release_round(const VmHandle& root) {
 }
 
 namespace vmbench {
+namespace {
+FileDescriptor open_snapshot_file(const fs::path& path, int flags) {
+    FileDescriptor descriptor(open(path.c_str(), flags | O_CLOEXEC, 0600));
+    require(descriptor.get() >= 0, "Cannot open snapshot memory: " + path.string());
+    return descriptor;
+}
+off_t snapshot_length(int descriptor) {
+    struct stat metadata{};
+    require(fstat(descriptor, &metadata) == 0 && metadata.st_size > 0, "Invalid snapshot memory size");
+    return metadata.st_size;
+}
+void sync_snapshot(int descriptor) {
+    require(fsync(descriptor) == 0, "Cannot synchronize snapshot memory");
+}
+void copy_extent(int source, int destination, off_t begin, off_t end) {
+    std::array<char, 65536> buffer;
+    while (begin < end) {
+        check_interrupted();
+        ssize_t count;
+        do { count = pread(source, buffer.data(), std::min<off_t>(buffer.size(), end - begin), begin); }
+        while (count < 0 && errno == EINTR);
+        require(count > 0, "Cannot read snapshot extent");
+        for (ssize_t written = 0; written < count;) {
+            ssize_t result;
+            do { result = pwrite(destination, buffer.data() + written, count - written, begin + written); }
+            while (result < 0 && errno == EINTR);
+            require(result > 0, "Cannot write snapshot extent");
+            written += result;
+        }
+        begin += count;
+    }
+}
+void copy_data_extents(int source, int destination, off_t length) {
+    for (off_t position = 0; position < length;) {
+        const auto data = lseek(source, position, SEEK_DATA);
+        if (data < 0 && errno == ENXIO) break;
+        require(data >= position && data < length, "Snapshot filesystem must support SEEK_DATA");
+        const auto hole = lseek(source, data, SEEK_HOLE);
+        require(hole > data && hole <= length, "Snapshot filesystem must support SEEK_HOLE");
+        copy_extent(source, destination, data, hole);
+        position = hole;
+    }
+}
+}
+
+std::string copy_snapshot_memory(const fs::path& source, const fs::path& destination, bool allow_reflink) {
+    auto input = open_snapshot_file(source, O_RDONLY);
+    auto output = open_snapshot_file(destination, O_RDWR | O_CREAT | O_EXCL);
+    const auto length = snapshot_length(input.get());
+    if (allow_reflink && ioctl(output.get(), FICLONE, input.get()) == 0) {
+        sync_snapshot(output.get());
+        return "reflink";
+    }
+    if (allow_reflink) require(errno == EOPNOTSUPP || errno == ENOTTY || errno == EXDEV || errno == EINVAL || errno == ENOSYS,
+        "Snapshot reflink failed (not an unsupported-filesystem error)");
+    require(ftruncate(output.get(), 0) == 0 && ftruncate(output.get(), length) == 0, "Cannot size sparse child memory");
+    copy_data_extents(input.get(), output.get(), length);
+    sync_snapshot(output.get());
+    return "sparse-copy";
+}
+}
+
+namespace vmbench {
 VmHandle FirecrackerBackend::start_process(int id) {
     const auto suffix = std::to_string(id);
     const auto control = work_ / ("f" + suffix + ".sock");
@@ -295,7 +365,9 @@ VmHandle FirecrackerBackend::start_process(int id) {
 }
 VmHandle FirecrackerBackend::boot() {
     auto root = start_process(0);
-    for (const auto& item : guest_configuration(options_, root->vsock)) {
+    auto configuration = guest_configuration(options_, root->vsock);
+    configuration["machine-config"].as_object()["track_dirty_pages"] = options_.snapshot_type == "diff";
+    for (const auto& item : configuration) {
         firecracker_request(root->control, "PUT", "/" + std::string(item.key()), item.value().as_object());
     }
     firecracker_request(root->control, "PUT", "/actions", {{"action_type", "InstanceStart"}});
@@ -305,18 +377,44 @@ VmHandle FirecrackerBackend::boot() {
 void FirecrackerBackend::capture_snapshot(const VmHandle& root, const SnapshotFiles& files) {
     firecracker_request(root->control, "PATCH", "/vm", {{"state", "Paused"}});
     firecracker_request(root->control, "PUT", "/snapshot/create", {
-        {"snapshot_type", "Full"}, {"snapshot_path", files.state.string()},
-        {"mem_file_path", files.memory.string()}, {"sync_snapshot_files", true}});
+        {"snapshot_type", options_.snapshot_type == "diff" ? "Diff" : "Full"}, {"snapshot_path", files.state.string()},
+        {"mem_file_path", (options_.snapshot_type == "diff" ? base_ : files.memory).string()}, {"sync_snapshot_files", true}});
     firecracker_request(root->control, "PATCH", "/vm", {{"state", "Resumed"}});
 }
 Object FirecrackerBackend::snapshot_metadata(const SnapshotFiles& files, uint64_t elapsed_ns) const {
     struct stat metadata{};
     require(stat(files.memory.c_str(), &metadata) == 0, "Cannot stat snapshot");
-    return {{"mechanism", "fresh full snapshot and restore"}, {"snapshot_policy", "per-fork"},
+    return {{"mechanism", options_.snapshot_type == "diff" ? "fresh KVM dirty-page diff and materialized restore" : "fresh full snapshot and restore"},
+        {"snapshot_type", options_.snapshot_type}, {"track_dirty_pages", options_.snapshot_type == "diff"},
+        {"child_track_dirty_pages", false}, {"snapshot_policy", "per-fork"},
         {"preparation_included_in_guest_ready", true}, {"prepare_ns", elapsed_ns},
         {"snapshot_path", files.state.string()}, {"snapshot_memory_path", files.memory.string()},
         {"snapshot_state_bytes", fs::file_size(files.state)}, {"snapshot_memory_bytes", static_cast<uint64_t>(metadata.st_size)},
         {"snapshot_allocated_bytes", static_cast<uint64_t>(metadata.st_blocks) * 512}, {"sync_snapshot_files", true}};
+}
+Object FirecrackerBackend::prepare_snapshot(const VmHandle& root, const SnapshotFiles& files) {
+    const auto started = now_ns();
+    const bool initial = base_.empty();
+    if (options_.snapshot_type == "diff" && initial) base_ = work_ / "base.mem";
+    // The base is never loaded by a child. Firecracker updates it in-place with
+    // dirty pages; its first diff from a booted VM supplies all nonzero history.
+    capture_snapshot(root, files);
+    const auto captured = now_ns();
+    Object extra{{"capture_ns", captured - started}};
+    if (options_.snapshot_type == "diff") {
+        extra["snapshot_copy_method"] = copy_snapshot_memory(base_, files.memory);
+        extra["backing_copy_ns"] = now_ns() - captured;
+        extra["merge_in_capture"] = true;
+        extra["initial_base"] = initial;
+        extra["base_memory_path"] = base_.string();
+        struct stat base{};
+        require(stat(base_.c_str(), &base) == 0, "Cannot stat cumulative base");
+        extra["base_memory_bytes"] = static_cast<uint64_t>(base.st_size);
+        extra["base_allocated_bytes"] = static_cast<uint64_t>(base.st_blocks) * 512;
+    }
+    auto metadata = snapshot_metadata(files, now_ns() - started);
+    for (const auto& item : extra) metadata[item.key()] = item.value();
+    return metadata;
 }
 Object FirecrackerBackend::prepare_round(const VmHandle&, int) {
     return {{"snapshot_policy", "per-fork"}};
@@ -326,13 +424,11 @@ CloneResult FirecrackerBackend::clone(const VmHandle& root, int id) {
     const auto [entry, inserted] = snapshots_.emplace(id, SnapshotFiles{prefix.string() + ".state", prefix.string() + ".mem"});
     require(inserted, "Snapshot ID reused before child cleanup");
     const auto& files = entry->second;
-    const auto started = now_ns();
-    capture_snapshot(root, files);
-    auto metadata = snapshot_metadata(files, now_ns() - started);
+    auto metadata = prepare_snapshot(root, files);
     auto child = start_process(id);
     firecracker_request(child->control, "PUT", "/snapshot/load", {{"snapshot_path", files.state.string()},
         {"mem_backend", Object{{"backend_type", "File"}, {"backend_path", files.memory.string()}}},
-        {"vsock_override", Object{{"uds_path", child->vsock.string()}}}, {"resume_vm", true}});
+        {"vsock_override", Object{{"uds_path", child->vsock.string()}}}, {"track_dirty_pages", false}, {"resume_vm", true}});
     return {child, std::move(metadata)};
 }
 void FirecrackerBackend::remove_socket_files(const VmHandle& vm) const {
@@ -347,14 +443,29 @@ void FirecrackerBackend::destroy(const VmHandle& vm) {
     if (!vm->alive) return;
     processes_.stop(vm, SIGTERM);
     if (const auto entry = snapshots_.find(vm->id); entry != snapshots_.end()) {
-        fs::remove(entry->second.state);
-        fs::remove(entry->second.memory);
+        remove_snapshot_files(entry->second);
         snapshots_.erase(entry);
     }
     remove_socket_files(vm);
 }
+void FirecrackerBackend::remove_snapshot_files(const SnapshotFiles& files) const {
+    fs::remove(files.state);
+    fs::remove(files.memory);
+}
 void FirecrackerBackend::release_round(const VmHandle&) {
     require(snapshots_.empty(), "Snapshot backing remains after round cleanup");
+}
+json::array FirecrackerBackend::cleanup() {
+    auto errors = ManagedBackend::cleanup();
+    try {
+        if (processes_.active().empty()) {
+            for (const auto& item : snapshots_) remove_snapshot_files(item.second);
+            snapshots_.clear();
+        }
+        if (!base_.empty()) { fs::remove(base_); base_.clear(); }
+    }
+    catch (const std::exception& error) { errors.push_back(json::value(error.what())); }
+    return errors;
 }
 }
 

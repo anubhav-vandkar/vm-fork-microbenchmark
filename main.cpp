@@ -32,6 +32,7 @@ void assign_option(Options& options, const std::string& key, const std::string& 
     else if (key == "--vcpus") options.vcpus = parse_integer(value);
     else if (key == "--settle-ms") options.settle_ms = parse_integer(value);
     else if (key == "--huge-pages") options.huge_pages = value;
+    else if (key == "--snapshot-type") options.snapshot_type = value;
     else if (key == "--work-dir") options.work_dir = value;
     else if (key == "--cgroup-dir") options.cgroup = value;
     else throw std::runtime_error("Unknown option " + key);
@@ -43,6 +44,7 @@ void validate_options(const Options& options) {
     require(options.memory_mib >= 128, "Guest capacity must be at least 128 MiB");
     require(options.settle_ms >= 0 && options.settle_ms <= 10000, "Invalid settling delay");
     require(options.huge_pages == "None" || options.huge_pages == "Transparent", "Invalid hugepage policy");
+    require(options.snapshot_type == "full" || options.snapshot_type == "diff", "Use --snapshot-type full or diff");
 }
 void resolve_paths(Options& options) {
     options.repo = fs::absolute(options.repo);
@@ -82,6 +84,7 @@ void print_help(std::ostream& output) {
               "  [--lightning-source DIR] [--firecracker-source DIR] [--lightning BIN] [--firecracker BIN]\n"
               "  [--repo DIR (alias for --lightning-source)] [--rounds 50] [--forks-per-round 50]\n"
               "  [--memory-mib 256] [--vcpus 1] [--huge-pages None|Transparent] [--settle-ms 200]\n"
+              "  [--snapshot-type full|diff (default: diff, KVM dirty-page tracking)]\n"
               "  [--work-dir /tmp] [--cgroup-dir DIR] [--preflight] | --self-test\n"
               "vm-fork-bench --report-only EXISTING_RUN_DIRECTORY\n";
 }
@@ -98,6 +101,8 @@ Object inspect_host(const Options& options) {
         {"kernel_exists", fs::is_regular_file(options.kernel)}, {"initrd_exists", fs::is_regular_file(options.initrd)},
         {"rounds", options.rounds}, {"forks_per_round", options.per_round},
         {"firecracker_snapshot_policy", "per-fork"},
+        {"firecracker_snapshot_type", options.snapshot_type},
+        {"work_directory", options.work_dir.string()},
         {"lightning_source", options.repo.string()}, {"firecracker_source", options.firecracker_repo.string()},
         {"total_forks", options.rounds * options.per_round}, {"maximum_live_vms", options.per_round + 1},
         {"memory_mib", options.memory_mib}, {"vcpus", options.vcpus}, {"huge_pages", options.huge_pages},
@@ -124,6 +129,8 @@ int run_test_executable() {
 }
 Object initial_summary(const Options& options, const Object& inspection) {
     return {{"backend", options.backend}, {"snapshot_policy", options.backend == "firecracker" ? "per-fork" : "live-fork"},
+        {"snapshot_type", options.backend == "firecracker" ? options.snapshot_type : "none"},
+        {"track_dirty_pages", options.backend == "firecracker" && options.snapshot_type == "diff"},
         {"creation_timing_includes_preparation", true}, {"preflight", inspection}, {"status", "running"}, {"language", "C++20"},
         {"controller_pid", getpid()}, {"source_repo", options.repo.string()}, {"kernel", options.kernel.string()},
         {"firecracker_source_repo", options.firecracker_repo.string()},

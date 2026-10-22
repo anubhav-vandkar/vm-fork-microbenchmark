@@ -76,7 +76,7 @@ namespace vmbench {
 enum class Command { Run, Help, Preflight, SelfTest, ReportOnly };
 struct Options {
     fs::path repo, firecracker_repo, lightning, firecracker, kernel, initrd, output, work_dir = "/tmp", cgroup;
-    std::string backend, huge_pages = "None";
+    std::string backend, huge_pages = "None", snapshot_type = "diff";
     int rounds = 50, per_round = 50, memory_mib = 256, vcpus = 1, settle_ms = 200;
     Command command = Command::Run;
 };
@@ -142,6 +142,7 @@ public:
     virtual json::array cleanup() = 0;
 };
 std::unique_ptr<Backend> make_backend(const Options& options, const fs::path& work);
+std::string copy_snapshot_memory(const fs::path& source, const fs::path& destination, bool allow_reflink = true);
 }
 
 namespace vmbench {

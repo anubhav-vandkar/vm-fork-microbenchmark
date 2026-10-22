@@ -10,10 +10,13 @@
    most 51 VMs alive. The next round cannot start until cleanup finishes.
 
 3. **Compare documented mechanisms.** Lightning performs live process forks and
-   reconstructs independent KVM objects. Firecracker takes a fresh synchronized
-   full snapshot before each child and restores from that child's unique files.
+   reconstructs independent KVM objects. Firecracker defaults to KVM dirty-page
+   diffs, natively updating a private cumulative base before each child and
+   restoring from an immutable reflink or sparse copy. Full mode remains selectable.
    Preparation is inside the child's creation timer and also reported as a
-   component. Retain backing until child exit and expose its memory/storage cost.
+   component, including native merging, copying and synchronization. Retain child
+   backing until exit, delete the cumulative base at final cleanup, and expose
+   allocated bytes and copy strategy without treating logical size as residency.
 
 4. **Measure shared memory correctly.** Use summed PSS as the primary resident
    process-group footprint. RSS can double-count shared pages. Record private

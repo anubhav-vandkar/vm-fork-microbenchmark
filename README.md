@@ -41,21 +41,30 @@ separation of concerns does not require a separate file for every helper.
 private guest RAM mappings and rebuilds its own KVM VM/vCPU objects. The code in
 the supplied repository explicitly drops inherited KVM owners in children.
 
-**Firecracker:** before every child, pause the persistent parent, create a fresh
-full snapshot with synchronization enabled, resume the parent, then restore the
-child with its own vsock endpoint. Each child has unique immutable state/RAM
-files, retained until that child exits. Fifty rounds of 50 children therefore
-create **2,500 snapshots**, each inside its child's creation timer.
-Preparation duration and state/RAM file sizes remain visible as components;
-the combined creation metric includes preparation exactly once.
+**Firecracker:** by default, enable KVM dirty-page tracking on the persistent
+parent and request a synchronized `Diff` snapshot before every child. The first
+diff of this freshly booted VM establishes a sparse, restorable base: untouched
+pages are zero. Later diffs are merged **by Firecracker directly into the same
+base RAM file**, using the pinned version's native in-place diff support.
+The cumulative base is never mapped by a child. Before each restore, freeze its
+contents into a separate child RAM file using a filesystem reflink when supported
+or a sparse copy otherwise (including on tmpfs). Each child uses the matching
+state file from that capture and its immutable RAM backing until it exits.
+Dirty tracking is disabled on restored children, which never produce snapshots.
 
-At 256 MiB configured RAM, 50 retained snapshots represent 12.5 GiB of logical
-RAM files per batch, and the full run writes 625 GiB of logical RAM snapshot
-data. Actual allocated storage, physical writes and resident cache depend on
-the filesystem and host. Files are deleted after each child exits, so 2,500
-snapshots do not accumulate on disk. Full snapshot creation can
-populate guest RAM and file cache; resulting footprint differences are part of
-the reported mechanism, not necessarily differences in pure metadata size.
+Fifty rounds of 50 children still create **2,500 snapshots**. Capture/native merge,
+child backing copy and synchronization are all inside the per-child preparation
+and guest-ready timers. Initial base creation is charged to the first child,
+not hidden in parent boot or added again when reporting the combined mean.
+Child files are deleted after exit; the cumulative base is deleted at final cleanup.
+
+Use `--snapshot-type full` for the previous full-snapshot-per-child baseline;
+the default is `--snapshot-type diff`. Full mode does not enable dirty tracking.
+The full mode writes all configured guest RAM on every capture. Diff mode writes
+tracked dirty pages and copies the allocated base extents when reflink is unavailable.
+Sparse files retain the full logical guest size, so allocated bytes, sharing and
+resident memory must be measured separately. If most memory is written, diff
+storage can approach full mode; no fixed savings are assumed.
 Upstream Firecracker has no equivalent live-fork endpoint.
 
 Both paths use the repo's minimal PID 1/vsock guest, with one vCPU and 256 MiB
@@ -132,8 +141,10 @@ The runner performs 50 rounds of 50 children for each backend, sequentially,
 with 4 GiB configured RAM, one vCPU and a 200 ms settling delay. Change
 `memory_mib` in `scripts/run-full-suite.sh` to adjust the capacity for both
 backends, preflight and saved settings. The controller's standalone default
-remains 256 MiB. At 4 GiB, 50 retained snapshots represent 200 GiB of logical
-RAM files per batch; actual allocated storage depends on the filesystem.
+remains 256 MiB. At 4 GiB, the 50 child backing files represent 200 GiB of logical
+RAM files per batch, plus a 4 GiB logical cumulative base in diff mode. Actual
+allocation depends on written pages and reflink/sparse-copy behavior. These
+logical sizes are not an estimate of physical disk usage or resident RAM.
 The runner verifies
 2,500 completions per backend and clean teardown. It uses a separate user
 systemd scope per backend when available, and records shared-cgroup fallback
@@ -141,6 +152,30 @@ explicitly. Results live under `results/full-suite/run-*`, with `latest` pointin
 to the latest attempt. Temporary sockets and snapshots stay under `build/w`.
 Paths should remain short enough for Unix sockets; use a similarly short project
 path on the server. `make clean` removes the prepared dependencies too.
+
+Select the previous full mode or a different temporary filesystem without editing
+the runner:
+
+```sh
+VM_BENCH_SNAPSHOT_TYPE=full ./scripts/run-full-suite.sh
+mkdir -m 700 -p "/dev/shm/vmbench-$UID"
+VM_BENCH_WORK_DIR="/dev/shm/vmbench-$UID" ./scripts/run-full-suite.sh
+```
+
+`VM_BENCH_SNAPSHOT_TYPE=diff` is the runner default. The chosen type and absolute
+work directory are recorded in preflight and settings. Existing tmpfs can use swap;
+use a `noswap` tmpfs or a suitable enforced swap limit when snapshot RAM must not
+reach disk. Keep paths short enough for Unix sockets. Runtime directories are
+removed automatically, while the user-created parent work directory remains empty.
+
+Diff mode uses only the existing Firecracker binary and controller; no external
+snapshot editor is needed. Native in-place merging is required by this implementation
+and is present in the pinned upstream baseline. A different Firecracker checkout
+must support this behavior (see the pinned
+[native merge implementation](https://github.com/firecracker-microvm/firecracker/blob/fd9fc7a9f164b73002d22065d17c150d8c262d91/src/vmm/src/vstate/vm.rs#L594)).
+Diff support is marked developer preview upstream:
+validate actual KVM runs on the target host before relying on performance results.
+Historical full and per-round measurements remain labeled with their original policy.
 
 Regenerate just the final report and metadata dashboard from an existing run:
 
