@@ -79,7 +79,7 @@ Recorder::Recorder(const Options& options)
     require(bool(raw_), "Cannot open raw measurement output");
 }
 Object Recorder::collect_event(const MeasurementEvent& event) const {
-    auto sample = collector_.collect(event.vms, event.phase != "child_ready");
+    auto sample = collector_.collect(event.vms, event.phase != "child_ready" && event.phase != "depth_ready");
     sample["phase"] = event.phase;
     sample["round"] = event.round;
     sample["position"] = event.position;
@@ -444,6 +444,266 @@ void generate_saved_report(const fs::path& directory, const fs::path& dashboard_
         write_text(status_path, "{\"status\":\"ok\",\"mode\":\"report_only\",\"vm_runs_started\":0}\n");
     } catch (const std::exception& error) {
         write_text(status_path, json::serialize(Object{{"status", "failed"}, {"mode", "report_only"}, {"vm_runs_started", 0}, {"error", error.what()}}) + "\n");
+        throw;
+    }
+}
+}
+
+namespace vmbench {
+namespace {
+using DepthSeries = std::map<std::string, std::map<int, Series>>;
+
+int expected_depth_sample(const Object& sample, size_t index, int maximum_depth) {
+    std::string phase;
+    int depth = 0, live = 0;
+    if (index == 0) phase = "before_boot";
+    else if (index == 1) { phase = "root_ready"; live = 1; }
+    else if (index <= static_cast<size_t>(maximum_depth * 2 + 1)) {
+        depth = static_cast<int>((index - 2) / 2) + 1;
+        phase = index % 2 == 0 ? "depth_ready" : "depth_verified";
+        live = depth + 1;
+    } else if (index == static_cast<size_t>(maximum_depth * 2 + 2)) {
+        phase = "lineage_verified"; depth = maximum_depth; live = depth + 1;
+    } else {
+        require(index == static_cast<size_t>(maximum_depth * 2 + 3), "Extra depth samples after teardown");
+        phase = "all_stopped";
+    }
+    require(text(sample.at("phase")) == phase && integer(sample.at("round")) == 0 &&
+        integer(sample.at("position")) == depth && integer(sample.at("live_vms")) == live &&
+        integer(sample.at("fork_number")) == (phase == "all_stopped" ? maximum_depth : depth),
+        "Depth lifecycle is incomplete or out of order");
+    const auto& processes = sample.at("processes").as_array();
+    require(processes.size() == static_cast<size_t>(live), "Depth process count differs from live VMs");
+    std::set<int64_t> pids;
+    for (size_t i = 0; i < processes.size(); ++i) {
+        const auto& process = processes[i].as_object();
+        const auto pid = integer(process.at("pid"));
+        require(integer(process.at("vm_id")) == static_cast<int64_t>(i) && pid > 0 && pids.insert(pid).second,
+            "Depth ancestry IDs or PIDs are inconsistent");
+    }
+    return depth;
+}
+
+const Object& newest_memory(const Object& sample) {
+    return sample.at("processes").as_array().back().as_object().at("memory_kib").as_object();
+}
+void collect_depth_memory(const Object& sample, Series& series, const std::string& prefix) {
+    const auto& memory = newest_memory(sample);
+    const double private_kib = integer(memory.at("Private_Dirty")) + integer(memory.at("Private_Clean"));
+    series[prefix + "private_mib"].push_back(private_kib / 1024.0);
+    series[prefix + "pss_mib"].push_back(integer(memory.at("Pss")) / 1024.0);
+    if (const auto huge = memory.if_contains("AnonHugePages")) {
+        series[prefix + "anon_huge_mib"].push_back(integer(*huge) / 1024.0);
+        series[prefix + "thp_observed"].push_back(integer(*huge) > 0 ? 1.0 : 0.0);
+    }
+    series[prefix + "chain_pss_mib"].push_back(integer(sample.at("memory_sum_kib").as_object().at("Pss")) / 1024.0);
+}
+
+void validate_depth_snapshot(const Object& metadata, int depth, const Object& settings,
+    std::set<std::string>& backing_paths, std::string& base_path) {
+    const auto type = text(settings.at("snapshot_type"));
+    const bool diff = type == "diff";
+    require(text(metadata.at("snapshot_type")) == type && metadata.at("track_dirty_pages").as_bool() == diff &&
+        metadata.at("child_track_dirty_pages").as_bool() == diff &&
+        metadata.at("sync_snapshot_files").as_bool() && metadata.at("preparation_included_in_guest_ready").as_bool(),
+        "Depth snapshot tracking, synchronization or timing policy is inconsistent");
+    const auto path = text(metadata.at("snapshot_memory_path"));
+    require(backing_paths.insert(path).second && integer(metadata.at("snapshot_memory_bytes")) ==
+        integer(settings.at("memory_mib")) * 1048576, "Depth backing reused or configured size changed");
+    const auto prepare = integer(metadata.at("prepare_ns"));
+    require(prepare >= 0 && integer(metadata.at("capture_ns")) >= 0 && integer(metadata.at("capture_ns")) <= prepare,
+        "Invalid depth capture timing");
+    if (!diff) return;
+    const auto base = text(metadata.at("base_memory_path"));
+    if (depth == 1) base_path = base;
+    const auto method = text(metadata.at("snapshot_copy_method"));
+    require(base == base_path && base != path && metadata.at("initial_base").as_bool() == (depth == 1) &&
+        (method == "reflink" || method == "sparse-copy") &&
+        integer(metadata.at("backing_copy_ns")) >= 0 &&
+        integer(metadata.at("capture_ns")) + integer(metadata.at("backing_copy_ns")) <= prepare,
+        "Invalid depth diff base, copy method or preparation accounting");
+}
+
+Object analyze_depth_chain(const fs::path& directory, const Object& settings, const std::string& backend,
+    std::map<int, Series>& series) {
+    const auto summary = read_object(directory / "summary.json");
+    require(text(summary.at("status")) == "ok" && summary.at("cleanup_errors").as_array().empty() &&
+        text(summary.at("experiment")) == "depth" && text(summary.at("backend")) == backend,
+        "Depth chain failed or cleanup is incomplete: " + directory.string());
+    const auto& preflight = summary.at("preflight").as_object();
+    for (const auto* key : {"depth", "populate_mib", "memory_mib", "vcpus", "huge_pages", "settle_ms"})
+        require(preflight.at(key) == settings.at(key), "Depth settings differ: " + std::string(key));
+    const int maximum_depth = static_cast<int>(integer(settings.at("depth")));
+    const auto& result = summary.at("result").as_object();
+    require(integer(result.at("depth_completed")) == maximum_depth && integer(result.at("forks_completed")) == maximum_depth &&
+        integer(result.at("maximum_live_vms")) == maximum_depth + 1 && integer(result.at("final_live_vms")) == maximum_depth + 1 &&
+        result.at("ancestors_retained").as_bool(), "Depth summary does not match retained-chain workload");
+    std::ifstream input(directory / "samples.jsonl");
+    require(bool(input), "Cannot read depth samples");
+    size_t index = 0;
+    int64_t previous_time = -1;
+    std::set<std::string> backing_paths;
+    std::vector<int64_t> lineage_pids;
+    std::string base_path, line;
+    json::value root_huge = nullptr;
+    json::value final_kvm = nullptr;
+    while (std::getline(input, line)) {
+        const auto sample = json::parse(line).as_object();
+        const int depth = expected_depth_sample(sample, index++, maximum_depth);
+        const auto time = integer(sample.at("monotonic_ns"));
+        require(time >= previous_time, "Depth sample clock moved backwards"); previous_time = time;
+        const auto phase = text(sample.at("phase"));
+        const auto& processes = sample.at("processes").as_array();
+        for (size_t i = 0; i < processes.size(); ++i) {
+            const auto pid = integer(processes[i].as_object().at("pid"));
+            if (i == lineage_pids.size()) lineage_pids.push_back(pid);
+            require(lineage_pids[i] == pid, "Retained ancestor PID changed within the chain");
+        }
+        const auto& extra = sample.at("extra").as_object();
+        if (phase == "root_ready") {
+            require(extra.at("population_verified").as_bool(), "Root population was not verified");
+            if (const auto huge = newest_memory(sample).if_contains("AnonHugePages")) root_huge = *huge;
+        } else if (phase == "depth_ready") {
+            require(integer(extra.at("depth")) == depth && integer(extra.at("source_id")) == depth - 1 &&
+                integer(extra.at("child_id")) == depth && extra.at("inheritance_verified").as_bool(),
+                "Newest child did not fork from its immediate predecessor");
+            const auto ready = integer(extra.at("guest_ready_ns")), returned = integer(extra.at("fork_return_ns"));
+            require(ready >= returned && returned >= 0, "Depth readiness timing is invalid");
+            const auto& metadata = extra.at("backend_metadata").as_object();
+            if (backend == "firecracker") {
+                validate_depth_snapshot(metadata, depth, settings, backing_paths, base_path);
+                require(integer(metadata.at("prepare_ns")) <= ready, "Snapshot preparation is outside readiness timing");
+            }
+            auto& values = series[depth];
+            values["guest_ready_ms"].push_back(ready / 1e6);
+            values["fork_return_ms"].push_back(returned / 1e6);
+            if (const auto pause = metadata.if_contains("parent_pause_us")) values["parent_pause_ms"].push_back(integer(*pause) / 1000.0);
+            collect_depth_memory(sample, values, "ready_");
+        } else if (phase == "depth_verified") {
+            require(integer(extra.at("depth")) == depth && extra.at("scan_verified").as_bool() && extra.at("isolation_verified").as_bool(),
+                "Depth scan or write isolation failed");
+            collect_depth_memory(sample, series[depth], "verified_");
+        } else if (phase == "lineage_verified") {
+            require(extra.at("ancestors_retained").as_bool(), "Retained lineage was not verified");
+        } else if (phase == "all_stopped") {
+            require(integer(sample.at("memory_sum_kib").as_object().at("Pss")) == 0, "Stopped VMs still appear in process accounting");
+            final_kvm = final_page_tables(sample);
+        }
+    }
+    require(index == static_cast<size_t>(maximum_depth * 2 + 4), "Depth stream is incomplete");
+    return {{"directory", directory.string()}, {"status", "ok"}, {"final_live_vms", 0},
+        {"root_anon_huge_kib", root_huge}, {"final_sec_pagetables", final_kvm}, {"samples", index}};
+}
+
+Object summarize_depth_values(const Series& series) {
+    Object result;
+    for (const auto& [name, original] : series) {
+        auto values = original;
+        require(!values.empty(), "Missing depth measurements");
+        std::sort(values.begin(), values.end());
+        const auto size = values.size();
+        result[name + "_median"] = size % 2 ? values[size / 2] : (values[size / 2 - 1] + values[size / 2]) / 2;
+        result[name + "_p99"] = values[(size * 99 + 99) / 100 - 1];
+        result[name + "_min"] = values.front();
+        result[name + "_max"] = values.back();
+        result[name + "_samples"] = size;
+    }
+    return result;
+}
+
+void write_depth_tables(const fs::path& directory, const Object& settings, const json::array& rows, const json::array& chains) {
+    std::ostringstream csv, html, markdown;
+    csv << "backend,depth,samples,guest_ready_ms_median,guest_ready_ms_p99,ready_private_mib_median,"
+           "ready_pss_mib_median,verified_private_mib_median,verified_pss_mib_median,ready_anon_huge_mib_median,parent_pause_ms_median\n";
+    html << "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Figure 4(b): fork depth</title>"
+            "<style>body{font:16px system-ui;max-width:1200px;margin:40px auto;padding:0 20px;color:#17232d}"
+            "table{border-collapse:collapse;width:100%}td,th{padding:8px;border-bottom:1px solid #ddd;text-align:right}"
+            "td:first-child,th:first-child{text-align:left}code{background:#eee;padding:2px 5px}.note{padding:14px;background:#f0f5fa}</style>"
+            "<h1>Figure 4(b): fork latency and memory vs depth</h1><p>Independent retained chains; "
+         << integer(settings.at("memory_mib")) << " MiB RAM, " << integer(settings.at("populate_mib")) << " MiB populated, "
+         << integer(settings.at("vcpus")) << " vCPU(s), " << integer(settings.at("repetitions")) << " repetitions.</p>"
+            "<p class=\"note\">THP is requested with Transparent. AnonHugePages is observed per process, not proof of the guest mapping's exact huge-page coverage. "
+            "Zero means no anonymous huge pages observed; file-backed Firecracker restores may differ. Check this before claiming a matched-THP comparison.</p>"
+            "<p>Ready memory is sampled after the first guest reply. Verified memory follows a full page-marker scan, child write-isolation check and settling. "
+            "Private memory = Private_Dirty + Private_Clean; PSS also includes shared memory. Both include VMM userspace, not KVM allocations. "
+            "Cgroup secondary page tables are contextual accounting: shared groups may include unrelated VMs and teardown accounting can lag.</p>"
+            "<p>Timers include clone/restore and first guest reply; scans, isolation checks, sampling, population and cleanup are outside the timer. "
+            "Firecracker preparation is included once. At ten samples per depth, nearest-rank p99 is the maximum, not a robust tail estimate.</p>"
+            "<p><a href=\"depth.csv\">Download plot-ready CSV</a> · <a href=\"comparison.json\">Full metadata</a></p>";
+    markdown << "# Figure 4(b): fork depth\n\nIndependent retained chains, immediate-parent state and private-write checks. "
+                "THP is requested; inspect observed AnonHugePages before claiming matched backing. "
+                "Nearest-rank p99 from ten repetitions equals the maximum and is not a stable tail estimate.\n\n";
+    const std::string header = "| Backend | Depth | Samples | Ready median ms | Ready p99 ms | Private ready MiB | PSS ready MiB | Private after checks MiB | AnonHugePages ready MiB |\n"
+                               "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n";
+    markdown << header;
+    html << "<table><thead><tr><th>Backend</th><th>Depth</th><th>Samples</th><th>Ready median ms</th><th>Ready p99 ms</th>"
+            "<th>Private ready MiB</th><th>PSS ready MiB</th><th>Private after checks MiB</th><th>AnonHugePages ready MiB</th></tr></thead><tbody>";
+    for (const auto& entry : rows) {
+        const auto& row = entry.as_object();
+        const auto backend = text(row.at("backend"));
+        csv << backend << ',' << integer(row.at("depth"));
+        for (const auto* key : {"guest_ready_ms_samples", "guest_ready_ms_median", "guest_ready_ms_p99", "ready_private_mib_median",
+             "ready_pss_mib_median", "verified_private_mib_median", "verified_pss_mib_median", "ready_anon_huge_mib_median", "parent_pause_ms_median"}) {
+            csv << ',';
+            if (const auto value = row.if_contains(key)) csv << json::serialize(*value);
+        }
+        csv << '\n';
+        markdown << "| " << backend;
+        html << "<tr><td>" << backend << "</td>";
+        for (const auto* key : {"depth", "guest_ready_ms_samples", "guest_ready_ms_median", "guest_ready_ms_p99", "ready_private_mib_median",
+             "ready_pss_mib_median", "verified_private_mib_median", "ready_anon_huge_mib_median"}) {
+            const auto value = display_number(row, key);
+            markdown << " | " << value;
+            html << "<td>" << value << "</td>";
+        }
+        markdown << " |\n"; html << "</tr>";
+    }
+    html << "</tbody></table><p>Validated chains: " << chains.size() << ". Every chain ended with zero live VMs.</p></html>";
+    write_text(directory / "depth.csv", csv.str());
+    write_text(directory / "report.md", markdown.str());
+    write_text(directory / "dashboard.html", html.str());
+}
+}
+
+void generate_depth_report(const fs::path& directory) {
+    require(fs::is_directory(directory), "Depth suite directory does not exist");
+    const auto status_path = directory / "reporting-status.json";
+    write_text(status_path, "{\"status\":\"running\",\"vm_runs_started\":0}\n");
+    try {
+        const auto settings = read_object(directory / "settings.json");
+        const auto depth = integer(settings.at("depth")), repetitions = integer(settings.at("repetitions"));
+        require(text(settings.at("experiment")) == "depth" && text(settings.at("huge_pages")) == "Transparent" &&
+            depth >= 1 && depth <= 64 && repetitions >= 1 && repetitions <= 1000,
+            "Invalid Figure 4(b) settings");
+        require(text(settings.at("snapshot_type")) == "full" || text(settings.at("snapshot_type")) == "diff", "Invalid depth snapshot mode");
+        const auto& backends = settings.at("backends").as_array();
+        require(!backends.empty() && backends.size() <= 2, "Choose one or both supported depth backends");
+        std::set<std::string> identities;
+        DepthSeries series;
+        json::array chains, rows;
+        for (const auto& value : backends) {
+            const auto backend = text(value);
+            require((backend == "lightning" || backend == "firecracker") && identities.insert(backend).second,
+                "Unsupported or repeated depth backend");
+            for (int repetition = 1; repetition <= repetitions; ++repetition) {
+                std::ostringstream name; name << "rep-" << std::setw(3) << std::setfill('0') << repetition;
+                auto chain = analyze_depth_chain(directory / backend / name.str(), settings, backend, series[backend]);
+                chain["backend"] = backend; chain["repetition"] = repetition; chains.push_back(std::move(chain));
+            }
+            for (int generation = 1; generation <= depth; ++generation) {
+                require(series[backend][generation]["guest_ready_ms"].size() == static_cast<size_t>(repetitions), "Missing depth repetition");
+                auto row = summarize_depth_values(series[backend][generation]);
+                row["backend"] = backend; row["depth"] = generation;
+                rows.push_back(std::move(row));
+            }
+        }
+        const Object report{{"experiment", "depth"}, {"validation", "passed"}, {"vm_runs_started", 0},
+            {"settings", settings}, {"chains", chains}, {"rows", rows}};
+        write_depth_tables(directory, settings, rows, chains);
+        write_text(directory / "comparison.json", json::serialize(report) + "\n");
+        write_text(status_path, "{\"status\":\"ok\",\"vm_runs_started\":0}\n");
+    } catch (const std::exception& error) {
+        write_text(status_path, json::serialize(Object{{"status", "failed"}, {"error", error.what()}, {"vm_runs_started", 0}}) + "\n");
         throw;
     }
 }

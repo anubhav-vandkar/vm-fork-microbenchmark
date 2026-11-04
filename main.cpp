@@ -21,6 +21,9 @@ void assign_option(Options& options, const std::string& key, const std::string& 
     if (key == "--repo" || key == "--lightning-source") options.repo = value;
     else if (key == "--firecracker-source") options.firecracker_repo = value;
     else if (key == "--backend") options.backend = value;
+    else if (key == "--experiment") options.experiment = value;
+    else if (key == "--depth") options.depth = parse_integer(value);
+    else if (key == "--populate-mib") options.populate_mib = parse_integer(value);
     else if (key == "--lightning") options.lightning = value;
     else if (key == "--firecracker") options.firecracker = value;
     else if (key == "--kernel") options.kernel = value;
@@ -38,6 +41,13 @@ void assign_option(Options& options, const std::string& key, const std::string& 
     else throw std::runtime_error("Unknown option " + key);
 }
 void validate_options(const Options& options) {
+    require(options.experiment == "batch" || options.experiment == "depth", "Use --experiment batch or depth");
+    if (options.experiment == "depth") {
+        require(options.depth >= 1 && options.depth <= 64, "Figure 4(b) depth must be between 1 and 64");
+        require(options.populate_mib > 0 && options.populate_mib <= options.memory_mib - 64,
+            "Population must be positive and leave at least 64 MiB for the guest kernel");
+        require(options.huge_pages == "Transparent", "Figure 4(b) requires --huge-pages Transparent");
+    }
     require(options.rounds > 0 && options.rounds <= 1000, "Invalid round count");
     require(options.per_round > 0 && options.per_round <= 1000, "Invalid batch size");
     require(options.vcpus > 0 && options.vcpus <= 32, "Invalid vCPU count");
@@ -58,23 +68,26 @@ void resolve_paths(Options& options) {
 }
 Options parse_options(int argc, char** argv) {
     Options options;
-    if (argc > 1 && std::string(argv[1]) == "--report-only") {
-        require(argc == 3, "Usage: vm-fork-bench --report-only RUN_DIRECTORY");
-        options.command = Command::ReportOnly;
+    if (argc > 1 && (std::string(argv[1]) == "--report-only" || std::string(argv[1]) == "--depth-report")) {
+        require(argc == 3, "Usage: vm-fork-bench --report-only or --depth-report RUN_DIRECTORY");
+        options.command = std::string(argv[1]) == "--depth-report" ? Command::DepthReport : Command::ReportOnly;
         options.output = fs::absolute(argv[2]);
         return options;
     }
     const char* home = std::getenv("HOME");
     options.repo = fs::path(home ? home : ".") / "lightning";
     options.firecracker_repo = fs::path(home ? home : ".") / "firecracker";
+    bool page_policy_explicit = false;
     for (int index = 1; index < argc; ++index) {
         const std::string key = argv[index];
         if (key == "--help") { options.command = Command::Help; return options; }
         if (key == "--self-test") { options.command = Command::SelfTest; return options; }
         if (key == "--preflight") { options.command = Command::Preflight; continue; }
         require(index + 1 < argc, "Missing value for " + key);
+        if (key == "--huge-pages") page_policy_explicit = true;
         assign_option(options, key, argv[++index]);
     }
+    if (options.experiment == "depth" && !page_policy_explicit) options.huge_pages = "Transparent";
     validate_options(options);
     resolve_paths(options);
     return options;
@@ -86,7 +99,9 @@ void print_help(std::ostream& output) {
               "  [--memory-mib 256] [--vcpus 1] [--huge-pages None|Transparent] [--settle-ms 200]\n"
               "  [--snapshot-type full|diff (default: diff, KVM dirty-page tracking)]\n"
               "  [--work-dir /tmp] [--cgroup-dir DIR] [--preflight] | --self-test\n"
-              "vm-fork-bench --report-only EXISTING_RUN_DIRECTORY\n";
+              "  [--experiment batch|depth] [--depth 64] [--populate-mib 64]\n"
+              "vm-fork-bench --report-only EXISTING_RUN_DIRECTORY\n"
+              "vm-fork-bench --depth-report EXISTING_DEPTH_SUITE_DIRECTORY\n";
 }
 }
 
@@ -99,13 +114,15 @@ Object inspect_host(const Options& options) {
         {"lightning_binary_exists", fs::is_regular_file(options.lightning)},
         {"firecracker_binary_exists", fs::is_regular_file(options.firecracker)},
         {"kernel_exists", fs::is_regular_file(options.kernel)}, {"initrd_exists", fs::is_regular_file(options.initrd)},
+        {"experiment", options.experiment}, {"depth", options.depth}, {"populate_mib", options.populate_mib},
         {"rounds", options.rounds}, {"forks_per_round", options.per_round},
         {"firecracker_snapshot_policy", "per-fork"},
         {"firecracker_snapshot_type", options.snapshot_type},
         {"work_directory", options.work_dir.string()},
         {"lightning_source", options.repo.string()}, {"firecracker_source", options.firecracker_repo.string()},
-        {"total_forks", options.rounds * options.per_round}, {"maximum_live_vms", options.per_round + 1},
-        {"memory_mib", options.memory_mib}, {"vcpus", options.vcpus}, {"huge_pages", options.huge_pages},
+        {"total_forks", options.experiment == "depth" ? options.depth : options.rounds * options.per_round},
+        {"maximum_live_vms", options.experiment == "depth" ? options.depth + 1 : options.per_round + 1},
+        {"memory_mib", options.memory_mib}, {"vcpus", options.vcpus}, {"huge_pages", options.huge_pages}, {"settle_ms", options.settle_ms},
         {"cgroup", options.cgroup.string()}, {"thp_policy", optional_text("/sys/kernel/mm/transparent_hugepage/enabled")}};
 }
 void validate_runtime(const Options& options, const Object& inspection) {
@@ -128,19 +145,27 @@ int run_test_executable() {
     throw std::runtime_error("Cannot execute tests");
 }
 Object initial_summary(const Options& options, const Object& inspection) {
-    return {{"backend", options.backend}, {"snapshot_policy", options.backend == "firecracker" ? "per-fork" : "live-fork"},
+    return {{"experiment", options.experiment}, {"backend", options.backend}, {"snapshot_policy", options.backend == "firecracker" ? "per-fork" : "live-fork"},
         {"snapshot_type", options.backend == "firecracker" ? options.snapshot_type : "none"},
         {"track_dirty_pages", options.backend == "firecracker" && options.snapshot_type == "diff"},
         {"creation_timing_includes_preparation", true}, {"preflight", inspection}, {"status", "running"}, {"language", "C++20"},
         {"controller_pid", getpid()}, {"source_repo", options.repo.string()}, {"kernel", options.kernel.string()},
         {"firecracker_source_repo", options.firecracker_repo.string()},
         {"initrd", options.initrd.string()}, {"binary", (options.backend == "lightning" ? options.lightning : options.firecracker).string()},
-        {"allocation_policy", "No added buffer; minimal booted guest and round counter only"}, {"mounts", optional_text("/proc/mounts")}};
+        {"allocation_policy", options.experiment == "depth"
+            ? "One populated buffer; first 4 KiB page modified before fork and in child for isolation checks"
+            : "No added buffer; minimal booted guest and round counter only"}, {"mounts", optional_text("/proc/mounts")}};
 }
 int execute_benchmark(Backend& backend, const Options& options, Recorder& recorder, Object& summary) {
     try {
-        Benchmark benchmark(backend, options, [&](const MeasurementEvent& event) { recorder.record(event); });
-        summary["result"] = benchmark.run();
+        const auto observer = [&](const MeasurementEvent& event) { recorder.record(event); };
+        if (options.experiment == "depth") {
+            DepthBenchmark benchmark(backend, options, observer);
+            summary["result"] = benchmark.run();
+        } else {
+            Benchmark benchmark(backend, options, observer);
+            summary["result"] = benchmark.run();
+        }
         summary["status"] = "ok";
         return 0;
     } catch (const std::exception& error) {
@@ -154,8 +179,9 @@ bool finalize_run(Backend& backend, const Options& options, Recorder& recorder, 
     summary["cleanup_errors"] = errors;
     if (!errors.empty()) summary["status"] = "cleanup_failed";
     sleep_ms(options.settle_ms);
-    recorder.record({errors.empty() ? "all_stopped" : "cleanup_incomplete", options.rounds, 0,
-        options.rounds * options.per_round, {}, {}});
+    recorder.record({errors.empty() ? "all_stopped" : "cleanup_incomplete",
+        options.experiment == "depth" ? 0 : options.rounds, 0,
+        options.experiment == "depth" ? options.depth : options.rounds * options.per_round, {}, {}});
     summary["metrics"] = recorder.report();
     write_text(options.output / "summary.json", json::serialize(summary) + "\n");
     return errors.empty();
@@ -176,6 +202,11 @@ int run_measurement(const Options& options, const Object& inspection) {
 int dispatch(Options options) {
     if (options.command == Command::Help) { print_help(std::cout); return 0; }
     if (options.command == Command::SelfTest) return run_test_executable();
+    if (options.command == Command::DepthReport) {
+        generate_depth_report(options.output);
+        std::cout << "Depth reporting passed; no VMs started. Results: " << options.output << '\n';
+        return 0;
+    }
     if (options.command == Command::ReportOnly) {
         const auto project = fs::read_symlink("/proc/self/exe").parent_path().parent_path();
         generate_saved_report(options.output, project / "templates/results-dashboard.html");

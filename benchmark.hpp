@@ -73,10 +73,11 @@ private:
 }
 
 namespace vmbench {
-enum class Command { Run, Help, Preflight, SelfTest, ReportOnly };
+enum class Command { Run, Help, Preflight, SelfTest, ReportOnly, DepthReport };
 struct Options {
     fs::path repo, firecracker_repo, lightning, firecracker, kernel, initrd, output, work_dir = "/tmp", cgroup;
-    std::string backend, huge_pages = "None", snapshot_type = "diff";
+    std::string backend, huge_pages = "None", snapshot_type = "diff", experiment = "batch";
+    int depth = 64, populate_mib = 64;
     int rounds = 50, per_round = 50, memory_mib = 256, vcpus = 1, settle_ms = 200;
     Command command = Command::Run;
 };
@@ -135,6 +136,7 @@ public:
     virtual VmHandle boot() = 0;
     virtual void marker(const VmHandle& root, int round) = 0;
     virtual Object ready(const VmHandle& vm) = 0;
+    virtual Object command(const VmHandle&, const std::string&) { throw std::runtime_error("Guest commands unsupported by backend"); }
     virtual Object prepare_round(const VmHandle& root, int round) = 0;
     virtual CloneResult clone(const VmHandle& root, int id) = 0;
     virtual void destroy(const VmHandle& vm) = 0;
@@ -216,6 +218,27 @@ private:
     VmList active_;
     int completed_ = 0;
 };
+}
+
+namespace vmbench {
+// One retained chain. The suite runner repeats independent chains in separate processes.
+class DepthBenchmark {
+public:
+    DepthBenchmark(Backend& backend, const Options& options, Observer observer);
+    Object run();
+private:
+    void initialize_root();
+    void fork_generation(int depth);
+    void verify_private_write(const VmHandle& source, const VmHandle& child, int depth);
+    void verify_lineage();
+    void emit(const std::string& phase, int depth, Object extra = {});
+    Backend& backend_;
+    const Options& options_;
+    Observer observer_;
+    VmList chain_;
+};
+uint64_t populated_checksum(int memory_mib);
+void generate_depth_report(const fs::path& directory);
 }
 
 namespace vmbench {

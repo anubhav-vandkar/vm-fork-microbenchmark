@@ -14,7 +14,7 @@ Before marking any C++ code change complete:
    Lightning/Firecracker VM runs. Do not claim VM validation or measured resource
    results without executing the test on a KVM-enabled host.
 
-The intended workload is one persistent parent, 50 rounds of 50 sequentially
+The original batch workload is one persistent parent, 50 rounds of 50 sequentially
 created children, with all 50 children retained for measurement and destroyed
 before the next round. There is no added guest memory buffer.
 Firecracker must create a fresh synchronized snapshot before every child,
@@ -43,3 +43,16 @@ the user explicitly requests broader profiling.
   in `ProcessManager` rather than duplicating it in the backends.
 - Update `ARCHITECTURE.md` when responsibility boundaries change. Avoid new
   catch-all utility files or combining unrelated responsibilities for convenience.
+
+## Figure 4(b): retained chain
+
+The separate depth experiment keeps every ancestor alive and forks only the
+newest VM, through depth 64. Populate one controlled buffer, check immediate
+inheritance and parent/child write isolation, and sample newest-child private
+memory separately from PSS. Keep full scans/checks/sampling outside creation
+timing. A THP request is not proof of actual guest huge-page coverage; report the
+observed evidence and its limitations. Snapshot-based descendants need dirty
+tracking enabled when they will themselves become sources. Materialized snapshot
+backing must not be described as a restore-time walk of historical delta layers.
+Each repetition starts a fresh chain and releases all VMs and backing afterward.
+Keep new orchestration/reporting separate from the existing batch validators.

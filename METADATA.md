@@ -99,3 +99,23 @@ tests are not results for this 2,500-fork experiment.
 Sources: [cgroup memory accounting](https://docs.kernel.org/admin-guide/cgroup-v2.html),
 [KVM statistics API](https://docs.kernel.org/virt/kvm/api.html#kvm-get-stats-fd), and
 the inspected Lightning and Linux KVM source code described in README.md.
+
+## Figure 4(b) depth measurements
+
+Depth mode adds ancestry/source/child IDs, inherited-state and complete marker-
+checksum checks, child-write isolation and final retained-lineage checks. At
+each generation `depth_ready` records clone/first-reply timing and newest-child
+memory, while `depth_verified` records memory after the scan/isolation probe and
+settling. Raw `processes[].memory_kib` retains private dirty/clean, PSS and
+`AnonHugePages`; the depth report exposes userspace USS and PSS separately.
+`AnonHugePages` covers the process rather than precisely identifying a guest VMA.
+Population uses one byte per 4 KiB page; each source/child probe changes one byte
+in the first populated page plus its guest counter. It does not imply that the
+host copies exactly one 4 KiB page, especially with THP and guest/kernel activity.
+Firecracker children are dirty-tracked sources in depth mode; materialized
+immutable backing retains history without a restore-time stack of delta files.
+Use `--depth-report` for this schema; `--report-only` remains the batch report.
+
+Depth reports preserve final cgroup `sec_pagetables` as context, rather than treating
+a nonzero shared-group value as proof of a leaked VM. Unrelated VMs and delayed
+accounting can affect it; owned-process teardown is checked independently.

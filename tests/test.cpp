@@ -18,6 +18,7 @@
 
 namespace vmbench::tests {
 struct Skipped { std::string reason; };
+namespace { void require_socket_access(); }
 void test_batch_lifecycle();
 void test_inheritance_failure();
 void test_proc_parser();
@@ -504,7 +505,10 @@ void make_diff_fixture(const fs::path& path, int capture) {
     else write_page(path, 131072, 'C');
 }
 
-void start_fake_guest(const fs::path& path, const std::shared_ptr<std::atomic<int>>& counter) {
+struct FakeGuestState {
+    std::atomic<int> counter{0}, allocated_mib{0}, first{0};
+};
+void start_fake_guest(const fs::path& path, const std::shared_ptr<FakeGuestState>& state) {
     FileDescriptor server(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
@@ -512,15 +516,20 @@ void start_fake_guest(const fs::path& path, const std::shared_ptr<std::atomic<in
     std::strcpy(address.sun_path, path.c_str());
     require(bind(server.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 && listen(server.get(), 4) == 0,
         "Cannot bind fake guest socket");
-    std::thread([server = std::move(server), counter] {
+    std::thread([server = std::move(server), state] {
         try {
             for (;;) {
                 FileDescriptor client(accept4(server.get(), nullptr, nullptr, SOCK_CLOEXEC));
                 require(client.get() >= 0 && read_line(client.get()) == "CONNECT 5000", "Fake guest connection failed");
                 send_all(client.get(), "OK 5000\n");
                 const auto command = read_line(client.get());
-                if (command.starts_with("SET ")) counter->store(std::stoi(command.substr(4)));
-                send_all(client.get(), json::serialize(Object{{"counter", counter->load()}, {"allocated", 0}}) + "\n");
+                if (command.starts_with("SET ")) state->counter.store(std::stoi(command.substr(4)));
+                if (command.starts_with("ALLOC ")) { state->allocated_mib.store(std::stoi(command.substr(6))); state->first.store(1); }
+                if (command.starts_with("WRITE ")) state->first.store(std::stoi(command.substr(6)));
+                const auto mib = state->allocated_mib.load();
+                const auto checksum = mib ? populated_checksum(mib) - 1 + state->first.load() : 0;
+                send_all(client.get(), json::serialize(Object{{"counter", state->counter.load()}, {"allocated", mib * 1048576},
+                    {"first", state->first.load()}, {"checksum", command == "SCAN" ? checksum : 0}}) + "\n");
             }
         } catch (...) { _exit(2); }
     }).detach();
@@ -562,7 +571,7 @@ int fake_firecracker(const fs::path& socket_path) {
         "Fake API bind/listen failed");
     bool paused = false, tracking = false;
     int captures = 0;
-    auto counter = std::make_shared<std::atomic<int>>(0);
+    auto state = std::make_shared<FakeGuestState>();
     for (;;) {
         FileDescriptor client(accept4(server.get(), nullptr, nullptr, SOCK_CLOEXEC));
         require(client.get() >= 0, "Fake API accept failed");
@@ -583,7 +592,7 @@ int fake_firecracker(const fs::path& socket_path) {
         bool fail = false;
         if (request.starts_with("PATCH /vm ")) paused = text(body.at("state")) == "Paused";
         else if (request.starts_with("PUT /machine-config ")) tracking = body.at("track_dirty_pages").as_bool();
-        else if (request.starts_with("PUT /vsock ")) start_fake_guest(text(body.at("uds_path")), counter);
+        else if (request.starts_with("PUT /vsock ")) start_fake_guest(text(body.at("uds_path")), state);
         else if (request.starts_with("PUT /boot-source ") || request.starts_with("PUT /actions ")) { /* Boot fixture. */ }
         else if (request.starts_with("PUT /snapshot/create ")) {
             const auto type = text(body.at("snapshot_type"));
@@ -591,7 +600,8 @@ int fake_firecracker(const fs::path& socket_path) {
                 "Snapshot was not paused/synchronized or dirty tracking was disabled");
             const auto memory = fs::path(text(body.at("mem_file_path")));
             require(!fs::exists(text(body.at("snapshot_path"))) && (type == "Diff" || !fs::exists(memory)), "Snapshot state or full memory file was reused");
-            write_text(text(body.at("snapshot_path")), json::serialize(Object{{"counter", counter->load()}}));
+            write_text(text(body.at("snapshot_path")), json::serialize(Object{{"counter", state->counter.load()},
+                {"allocated_mib", state->allocated_mib.load()}, {"first", state->first.load()}, {"captures", captures + (type == "Diff")}}));
             if (type == "Diff") {
                 require(memory.filename() == "base.mem" && (fs::exists(memory) == (captures > 0)), "Diff did not update its cumulative base");
                 make_diff_fixture(memory, ++captures);
@@ -601,11 +611,16 @@ int fake_firecracker(const fs::path& socket_path) {
         } else if (request.starts_with("PUT /snapshot/load ")) {
             require(fs::is_regular_file(text(body.at("snapshot_path"))) &&
                 fs::is_regular_file(text(body.at("mem_backend").as_object().at("backend_path"))) &&
-                body.at("resume_vm").as_bool() && !body.at("track_dirty_pages").as_bool(), "Restore backing is missing or child dirty tracking was enabled");
+                body.at("resume_vm").as_bool(), "Restore backing is missing");
+            tracking = body.at("track_dirty_pages").as_bool();
             fail = fs::exists(socket_path.string() + ".fail");
             if (!fail) {
-                counter->store(static_cast<int>(integer(json::parse(read_text(text(body.at("snapshot_path")))).as_object().at("counter"))));
-                start_fake_guest(text(body.at("vsock_override").as_object().at("uds_path")), counter);
+                const auto saved = json::parse(read_text(text(body.at("snapshot_path")))).as_object();
+                state->counter.store(static_cast<int>(integer(saved.at("counter"))));
+                state->allocated_mib.store(static_cast<int>(integer(saved.at("allocated_mib"))));
+                state->first.store(static_cast<int>(integer(saved.at("first"))));
+                captures = static_cast<int>(integer(saved.at("captures")));
+                start_fake_guest(text(body.at("vsock_override").as_object().at("uds_path")), state);
             }
         } else throw std::runtime_error("Unexpected fake API request");
         std::ofstream trace(socket_path.string() + ".trace", std::ios::app);
@@ -616,6 +631,7 @@ int fake_firecracker(const fs::path& socket_path) {
 }
 
 void test_firecracker_fresh_snapshots() {
+    require_socket_access();
     TemporaryDirectory temporary(fs::temp_directory_path());
     const auto executable = fs::read_symlink("/proc/self/exe");
     const auto control = temporary.path() / "parent.sock";
@@ -659,6 +675,7 @@ void test_firecracker_fresh_snapshots() {
 }
 
 void test_firecracker_diff_snapshots() {
+    require_socket_access();
     TemporaryDirectory temporary(fs::temp_directory_path());
     Options options;
     options.backend = "firecracker";
@@ -708,6 +725,197 @@ void test_firecracker_diff_snapshots() {
 }
 }
 
+
+namespace vmbench::tests {
+namespace {
+class DepthFake final : public Backend {
+public:
+    VmHandle boot() override {
+        auto vm = std::make_shared<Vm>(); vm->pid = 10000;
+        nodes.push_back(vm); states[0] = {0, 0, 0}; return vm;
+    }
+    void marker(const VmHandle& vm, int value) override { states.at(vm->id).counter = value; }
+    Object ready(const VmHandle& vm) override {
+        require(vm->alive, "Depth fake used a dead VM");
+        const auto& state = states.at(vm->id);
+        return {{"counter", state.counter}, {"allocated", state.mib * 1048576}, {"first", state.first}, {"checksum", 0}};
+    }
+    Object command(const VmHandle& vm, const std::string& request) override {
+        auto& state = states.at(vm->id);
+        if (request.starts_with("ALLOC ")) { state.mib = std::stoi(request.substr(6)); state.first = 1; }
+        else if (request.starts_with("WRITE ")) {
+            state.first = std::stoi(request.substr(6));
+            if (shared_writes && vm->id > 0) states.at(vm->id - 1).first = state.first;
+        }
+        auto result = ready(vm);
+        if (request == "SCAN") result["checksum"] = populated_checksum(state.mib) - 1 + state.first + (bad_scan && vm->id > 0);
+        return result;
+    }
+    Object prepare_round(const VmHandle&, int) override { throw std::runtime_error("Depth unexpectedly used batch preparation"); }
+    CloneResult clone(const VmHandle& source, int id) override {
+        require(source == nodes.back() && source->id == id - 1 &&
+            std::all_of(nodes.begin(), nodes.end(), [](const auto& vm) { return vm->alive; }),
+            "Depth did not retain ancestors or clone the immediate predecessor");
+        auto vm = std::make_shared<Vm>(); vm->id = id; vm->pid = 10000 + id;
+        states[id] = states.at(wrong_source ? 0 : source->id); nodes.push_back(vm);
+        return {vm, {{"parent_pause_us", 10}}};
+    }
+    void destroy(const VmHandle& vm) override { vm->alive = false; }
+    void release_round(const VmHandle&) override { throw std::runtime_error("Depth unexpectedly used batch cleanup"); }
+    json::array cleanup() override { for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) destroy(*it); return {}; }
+    VmList nodes;
+    bool shared_writes = false, bad_scan = false, wrong_source = false;
+private:
+    struct State { int counter, mib, first; };
+    std::map<int, State> states;
+};
+Object depth_sample(const MeasurementEvent& event, int64_t clock) {
+    json::array processes;
+    int pss = 0;
+    for (const auto& vm : event.vms) {
+        const int memory = 100 + vm->id * 2;
+        pss += memory;
+        processes.push_back(Object{{"vm_id", vm->id}, {"pid", vm->pid},
+            {"memory_kib", Object{{"Pss", memory}, {"Private_Dirty", 10 + vm->id}, {"Private_Clean", 2}, {"AnonHugePages", 65536}}}});
+    }
+    return {{"monotonic_ns", clock}, {"phase", event.phase}, {"round", event.round}, {"position", event.position},
+        {"fork_number", event.fork_number}, {"live_vms", event.vms.size()}, {"processes", processes},
+        {"memory_sum_kib", Object{{"Pss", pss}}}, {"cgroup", nullptr}, {"extra", event.extra}};
+}
+void require_socket_access() {
+    int pair[2];
+    require(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0, "Cannot probe simulator socket access");
+    FileDescriptor left(pair[0]), right(pair[1]);
+    if (send(left.get(), "x", 1, MSG_NOSIGNAL) < 0 && errno == EPERM)
+        throw Skipped{"Unix-socket sends denied by execution sandbox (EPERM); API simulator not run"};
+}
+}
+void test_depth_lifecycle() {
+    Options options; options.experiment = "depth"; options.settle_ms = 0;
+    DepthFake backend;
+    int ready = 0, verified = 0;
+    DepthBenchmark benchmark(backend, options, [&](const MeasurementEvent& event) {
+        require(event.vms.size() == static_cast<size_t>(event.position + 1), "Depth live count differs from ancestry");
+        ready += event.phase == "depth_ready"; verified += event.phase == "depth_verified";
+    });
+    const auto result = benchmark.run();
+    require(ready == 64 && verified == 64 && backend.nodes.size() == 65 && integer(result.at("maximum_live_vms")) == 65,
+        "Depth-64 retained chain did not complete");
+    require(backend.cleanup().empty() && std::none_of(backend.nodes.begin(), backend.nodes.end(), [](const auto& vm) { return vm->alive; }),
+        "Depth fake cleanup left ancestors alive");
+}
+void test_depth_validation() {
+    for (int failure = 0; failure < 3; ++failure) {
+        Options options; options.experiment = "depth"; options.depth = 4; options.settle_ms = 0;
+        DepthFake backend;
+        backend.shared_writes = failure == 0; backend.bad_scan = failure == 1; backend.wrong_source = failure == 2;
+        bool rejected = false;
+        try { DepthBenchmark benchmark(backend, options, [](const MeasurementEvent&) {}); benchmark.run(); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "Corrupt ancestry, populated pages or shared child writes were accepted");
+        backend.cleanup();
+    }
+}
+void test_depth_cli() {
+    const auto options = parse({"benchmark", "--experiment", "depth", "--depth", "64", "--populate-mib", "128", "--memory-mib", "512"});
+    require(options.experiment == "depth" && options.depth == 64 && options.huge_pages == "Transparent" &&
+        integer(inspect_host(options).at("total_forks")) == 64 && integer(inspect_host(options).at("maximum_live_vms")) == 65,
+        "Depth CLI defaults or planned counts are wrong");
+    require(parse({"benchmark", "--depth-report", "."}).command == Command::DepthReport, "Depth report requires KVM or run parsing");
+    for (const auto& arguments : std::vector<std::vector<std::string>>{
+        {"benchmark", "--experiment", "depth", "--depth", "65"},
+        {"benchmark", "--experiment", "depth", "--depth", "0"},
+        {"benchmark", "--experiment", "depth", "--populate-mib", "256"},
+        {"benchmark", "--experiment", "depth", "--huge-pages", "None"},
+        {"benchmark", "--experiment", "invalid"}}) {
+        bool rejected = false;
+        try { parse(arguments); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "Invalid Figure 4(b) parameters accepted");
+    }
+}
+void test_depth_reporting() {
+    TemporaryDirectory temporary(fs::temp_directory_path());
+    Options options; options.experiment = "depth"; options.depth = 3; options.settle_ms = 0; options.huge_pages = "Transparent";
+    const Object settings{{"experiment", "depth"}, {"depth", 3}, {"populate_mib", 64}, {"memory_mib", 256},
+        {"vcpus", 1}, {"huge_pages", "Transparent"}, {"settle_ms", 0}, {"repetitions", 2},
+        {"snapshot_type", "diff"}, {"backends", json::array{"lightning"}}};
+    write_text(temporary.path() / "settings.json", json::serialize(settings));
+    const auto output = temporary.path() / "lightning/rep-001";
+    fs::create_directories(output);
+    std::vector<Object> samples{depth_sample({"before_boot", 0, 0, 0, {}, {}}, 0)};
+    DepthFake backend;
+    DepthBenchmark benchmark(backend, options, [&](const MeasurementEvent& event) { samples.push_back(depth_sample(event, samples.size())); });
+    const auto result = benchmark.run();
+    samples.push_back(depth_sample({"all_stopped", 0, 0, 3, {}, {}}, samples.size()));
+    write_text(output / "summary.json", json::serialize(Object{{"status", "ok"}, {"backend", "lightning"}, {"experiment", "depth"},
+        {"cleanup_errors", json::array{}}, {"preflight", settings}, {"result", result}}));
+    auto save = [&] {
+        std::ostringstream data;
+        for (const auto& sample : samples) data << json::serialize(sample) << '\n';
+        write_text(output / "samples.jsonl", data.str());
+    };
+    samples.back()["cgroup"] = Object{{"memory.stat", Object{{"sec_pagetables", 4096}}}};
+    save();
+    fs::copy(output, temporary.path() / "lightning/rep-002", fs::copy_options::recursive);
+    auto second = samples;
+    for (auto& sample : second) {
+        if (text(sample.at("phase")) != "depth_ready") continue;
+        auto& extra = sample["extra"].as_object();
+        extra["guest_ready_ns"] = integer(extra.at("guest_ready_ns")) + 2000000;
+    }
+    std::ostringstream second_data;
+    for (const auto& sample : second) second_data << json::serialize(sample) << '\n';
+    write_text(temporary.path() / "lightning/rep-002/samples.jsonl", second_data.str());
+    generate_depth_report(temporary.path());
+    const auto report = json::parse(read_text(temporary.path() / "comparison.json")).as_object();
+    const auto& first_row = report.at("rows").as_array().front().as_object();
+    require(integer(first_row.at("guest_ready_ms_samples")) == 2 &&
+        first_row.at("guest_ready_ms_max").as_double() - first_row.at("guest_ready_ms_min").as_double() > 1.999 &&
+        std::abs(first_row.at("guest_ready_ms_median").as_double() - first_row.at("guest_ready_ms_min").as_double() - 1.0) < 1e-9 &&
+        first_row.at("guest_ready_ms_p99") == first_row.at("guest_ready_ms_max"), "Depth repetition aggregation is incorrect");
+    require(report.at("rows").as_array().size() == 3 && integer(report.at("vm_runs_started")) == 0 &&
+        read_text(temporary.path() / "depth.csv").find("verified_private_mib_median") != std::string::npos &&
+        read_text(temporary.path() / "dashboard.html").find("AnonHugePages") != std::string::npos,
+        "Depth report, separate memory phases or THP evidence missing");
+    samples[4]["extra"].as_object()["source_id"] = 0; save();
+    bool rejected = false;
+    try { generate_depth_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
+    require(rejected && text(json::parse(read_text(temporary.path() / "reporting-status.json")).as_object().at("status")) == "failed",
+        "Depth reporter accepted a sibling fanout as a chain");
+    samples[4]["extra"].as_object()["source_id"] = 1;
+    samples[4]["processes"].as_array().front().as_object()["pid"] = 9999; save(); rejected = false;
+    try { generate_depth_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "Depth reporter accepted replacement of a retained ancestor");
+    samples[4]["processes"].as_array().front().as_object()["pid"] = backend.nodes.front()->pid;
+    samples.pop_back(); save(); rejected = false;
+    try { generate_depth_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "Depth report accepted missing final teardown");
+}
+void test_firecracker_depth() {
+    require_socket_access();
+    for (const auto* type : {"diff", "full"}) {
+        TemporaryDirectory temporary(fs::temp_directory_path());
+        Options options; options.experiment = "depth"; options.depth = 3; options.populate_mib = 1; options.settle_ms = 0;
+        options.snapshot_type = type; options.backend = "firecracker";
+        options.firecracker = fs::read_symlink("/proc/self/exe"); options.output = temporary.path();
+        auto backend = make_backend(options, temporary.path());
+        int observed = 0;
+        DepthBenchmark benchmark(*backend, options, [&](const MeasurementEvent& event) {
+            if (event.phase != "depth_ready") return;
+            require(event.extra.at("backend_metadata").as_object().at("child_track_dirty_pages").as_bool() == (options.snapshot_type == "diff"),
+                "Restored depth source dirty tracking does not match snapshot mode");
+            ++observed;
+        });
+        benchmark.run();
+        require(observed == 3 && read_text(temporary.path() / "f1.sock.trace").find("PUT /snapshot/create") != std::string::npos &&
+            read_text(temporary.path() / "f2.sock.trace").find("PUT /snapshot/create") != std::string::npos,
+            "Firecracker depth did not snapshot restored descendants");
+        require(backend->cleanup().empty() && !fs::exists(temporary.path() / "base.mem") && !fs::exists(temporary.path() / "c3.mem"),
+            "Depth cleanup retained Firecracker backing");
+    }
+}
+}
+
 int main(int argc, char** argv) {
     using namespace vmbench::tests;
     if (argc >= 3 && std::string(argv[1]) == "--api-sock") {
@@ -715,6 +923,9 @@ int main(int argc, char** argv) {
         catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 2; }
     }
     const std::vector<std::pair<const char*, void(*)()>> tests = {
+        {"depth-64 retained chain", test_depth_lifecycle}, {"depth inheritance/scan/isolation failures", test_depth_validation},
+        {"depth CLI and THP policy", test_depth_cli}, {"saved depth reporting and rejection", test_depth_reporting},
+        {"Firecracker recursive full/diff sources (simulated API)", test_firecracker_depth},
         {"2500-fork batch lifecycle", test_batch_lifecycle}, {"inheritance failure detection", test_inheritance_failure},
         {"proc parser", test_proc_parser}, {"live process collection", test_live_process_collection},
         {"minimal cgroup categories", test_cgroup_filter}, {"KVM PID matching", test_kvm_pid_matching},

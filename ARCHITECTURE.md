@@ -58,3 +58,25 @@ Firecracker backend's pause/capture/resume sequence, unique backing retention,
 normal teardown, sparse zero/hole semantics, history across rounds, child backing
 immutability, dirty tracking on boot and failed-capture/restore cleanup. Saved
 fixtures test full/diff/legacy timing and reject invalid diff metadata.
+
+## Retained-chain experiment (Figure 4b)
+
+`--experiment depth` selects `DepthBenchmark` in `benchmark.cpp`; the original
+batch orchestration remains separate. The chain controller uses the shared
+backend interface's guest commands to populate/check memory and always clones
+from the immediate predecessor. It emits first-ready and post-verification
+samples, retaining ancestors for final lineage checks and backend-owned cleanup.
+`vm.cpp` enables dirty tracking on restored Firecracker depth sources, while
+batch leaf children keep their existing tracking policy. No VMM source changes
+are needed. Each repetition is a fresh controller/backend process, so snapshot
+bases and process lifetimes never carry over between independent chains.
+
+`scripts/run-depth-suite.sh` owns repetitions and selected backends, records
+settings/provenance, and optionally uses a separate cgroup scope per chain.
+`--depth-report` is a distinct saved-data path in `report.cpp`: it checks ancestry,
+PID stability, paired measurement phases, counters, snapshot tracking/timing and
+final teardown before aggregating by backend/depth. It writes a portable HTML
+table and numeric CSV. It does not reuse the sibling-batch validator or relabel
+historical measurements. Ten repetitions provide ten samples per depth, not
+640 samples for each depth's p99. Anonymous huge-page observations are explicit;
+requesting THP is not taken as evidence of actual guest-VMA coverage.

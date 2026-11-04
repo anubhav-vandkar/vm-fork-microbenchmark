@@ -59,7 +59,7 @@ lightning="$project/build/vmm/lightning/release/lightning"
 firecracker="$project/build/vmm/firecracker/release/firecracker"
 kernel="$project/build/guest/vmlinux"
 initrd="$project/build/guest/initramfs.cpio.gz"
-memory_mib=4096
+memory_mib=256
 for executable in "$lightning" "$firecracker"; do
     [[ -x "$executable" ]] || { status=missing_dependencies; echo "Missing executable: $executable"; exit 2; }
 done

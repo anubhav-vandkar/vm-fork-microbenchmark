@@ -138,11 +138,11 @@ select separate source trees (defaults `~/lightning` and `~/firecracker`).
 `--firecracker BIN` for other build locations. The controller does not build sources.
 
 The runner performs 50 rounds of 50 children for each backend, sequentially,
-with 4 GiB configured RAM, one vCPU and a 200 ms settling delay. Change
+with 256 MiB configured RAM, one vCPU and a 200 ms settling delay. Change
 `memory_mib` in `scripts/run-full-suite.sh` to adjust the capacity for both
 backends, preflight and saved settings. The controller's standalone default
-remains 256 MiB. At 4 GiB, the 50 child backing files represent 200 GiB of logical
-RAM files per batch, plus a 4 GiB logical cumulative base in diff mode. Actual
+is also 256 MiB. At 256 MiB, the 50 child backing files represent 12.5 GiB of logical
+RAM files per batch, plus a 256 MiB logical cumulative base in diff mode. Actual
 allocation depends on written pages and reflink/sparse-copy behavior. These
 logical sizes are not an estimate of physical disk usage or resident RAM.
 The runner verifies
@@ -350,3 +350,142 @@ benchmark reports may describe superseded lifecycle restrictions.
 - [Linux cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 - [KVM API and statistics](https://docs.kernel.org/virt/kvm/api.html)
 - [Boost.JSON header-only build](https://www.boost.org/doc/libs/1_89_0/libs/json/doc/html/index.html#json.overview.header_only)
+
+## Figure 4(b): latency and private memory versus fork depth
+
+This implements the **Lightning/Firecracker baseline and pre-CXL validation**
+for Figure 4(b). It does not implement Skyfall's CXL memory backing or cross-host
+sharing. Successful runs validate the existing VM paths and measurement
+controller; final Skyfall measurements require its CXL implementation and
+additional backing/sharing checks. Figures 3 and 4(a) are not implemented by
+this depth runner.
+
+This is a separate experiment from the 50-sibling batch suite. Each independent
+chain forks its newest VM, retains every ancestor, and ends at depth 64 (65 live
+VMs including the original parent). The runner tears down the entire chain
+before starting the next repetition. Default pilot: **Lightning only, 512 MiB
+RAM, 128 MiB populated, 1 vCPU, Transparent huge pages, 10 repetitions**.
+These are explicit pilot settings, not the 8-vCPU setup of Figure 3.
+
+For a fresh Ubuntu server checkout with Lightning sources at `~/lightning`,
+install prerequisites and prepare both VMMs and the guest once:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential git curl ca-certificates pkg-config cmake \
+  clang llvm lld flex bison bc cpio xz-utils libssl-dev libelf-dev zlib1g-dev \
+  libseccomp-dev libboost-json-dev jq util-linux
+./scripts/prepare-local.sh "$HOME/lightning"
+```
+
+Preparation downloads the pinned independent Firecracker source automatically,
+builds both VMMs and the guest, and forces controller compilation and self-tests.
+Allow it to finish successfully; compiler logs are under `results/full-suite/`.
+Then run a small smoke test before attempting depth 64:
+
+```sh
+VM_BENCH_BACKENDS="lightning firecracker" \
+VM_BENCH_DEPTH=4 VM_BENCH_REPETITIONS=1 \
+VM_BENCH_MEMORY_MIB=512 VM_BENCH_POPULATE_MIB=128 \
+VM_BENCH_VCPUS=1 VM_BENCH_SNAPSHOT_TYPE=diff \
+  ./scripts/run-depth-suite.sh
+cat results/depth/latest/runner-status.json
+jq '.chains[] | {backend, status, final_live_vms}' results/depth/latest/comparison.json
+```
+
+This creates four forks per backend, runs the backends sequentially, and retains
+at most five VMs at once. Success requires runner/chain status `ok` and zero final
+live VMs. The dashboard is `results/depth/latest/dashboard.html`.
+
+With dependencies already prepared, run from this project directory:
+
+```sh
+mkdir -p build/tmp
+TMPDIR="$PWD/build/tmp" CCACHE_DISABLE=1 make -B check
+./scripts/run-depth-suite.sh
+```
+
+The script must run from a normal Linux host terminal with KVM access. It uses
+prepared VMMs under `build/vmm`, the existing guest kernel/initramfs under
+`build/guest`, and project-local temporary files under `build/w`. It does not
+require CXL, RDMA, additional network setup or writable VM disk images. It does
+not modify the Lightning or Firecracker source checkouts or build either VMM.
+The guest must implement `ALLOC`, `SET`, `WRITE`, `GET`, and `SCAN` as in the
+prepared minimal guest; an initial checksum check rejects incompatible guests.
+Build prerequisites remain Make, a C++20 compiler and Boost.JSON. Building the
+VMM dependencies through `prepare-local.sh` also requires `libseccomp-dev` on
+Ubuntu, in addition to the other native build tools; this is a build-time
+requirement even when execution uses `--no-seccomp`.
+
+Configuration is explicit and independent from `run-full-suite.sh`:
+
+```sh
+# Match a larger VM / CPU configuration after the default pilot works.
+VM_BENCH_MEMORY_MIB=4096 VM_BENCH_POPULATE_MIB=1024 VM_BENCH_VCPUS=8 \
+  ./scripts/run-depth-suite.sh
+
+# Optional matching Firecracker baseline, run after Lightning (not concurrently).
+VM_BENCH_BACKENDS="lightning firecracker" ./scripts/run-depth-suite.sh
+```
+
+Other settings: `VM_BENCH_DEPTH` (1–64), `VM_BENCH_REPETITIONS` (1–1000),
+`VM_BENCH_SETTLE_MS` (default 200), `VM_BENCH_SNAPSHOT_TYPE` (`diff` or `full`),
+`VM_BENCH_WORK_DIR`, `VM_BENCH_LIGHTNING`, `VM_BENCH_FIRECRACKER`,
+`VM_BENCH_KERNEL`, and `VM_BENCH_INITRD`. Memory/population sizes are in MiB.
+THP is requested, never enabled globally by this script. A 1-generation/1-repeat
+smoke test is `VM_BENCH_DEPTH=1 VM_BENCH_REPETITIONS=1 ./scripts/run-depth-suite.sh`.
+
+The original parent populates one buffer by writing one marker per 4 KiB page.
+Before each fork the source changes a counter and one byte in the first
+populated page. The child must immediately serve that inherited counter and byte.
+The timer starts before the clone and ends at this first guest reply. A subsequent
+scan checks the complete buffer's marker checksum; the child then changes its
+own counter and first byte, and the source must retain its old values. These
+checks, settling, metadata reads, boot, initial population and final cleanup are
+outside creation timing. Every retained ancestor's expected marker is checked
+again at the end. This is a controlled memory workload, not an agent, network or
+disk-readiness experiment.
+
+Two memory phases are recorded at every depth: **ready** immediately after the
+first guest reply, and **verified** after the scan, isolation check and settling.
+The primary per-child private footprint is `Private_Dirty + Private_Clean`
+(userspace USS). PSS is reported separately and contains a proportional share of
+shared pages. Both include VMM userspace; neither is a total-KVM-bytes metric.
+All original process memory fields and minimal KVM measurements remain in raw
+samples. Population and source writes affect both methods equally; guest/kernel
+activity and huge-page copying/splitting can also affect private memory.
+
+`AnonHugePages` is recorded for each process. This is evidence of process-level
+anonymous huge-page backing, not exact guest-VMA coverage. A zero/missing value
+must not be described as verified THP backing. Firecracker's file-backed restored
+memory may have different backing from Lightning's inherited anonymous memory;
+check the observations before making a matched-THP or general performance claim.
+
+In Firecracker diff mode, **every restored descendant has dirty tracking enabled**
+because it will become the next source. Each generation snapshots its immediate
+parent and updates the private cumulative base, then receives an immutable
+reflink/sparse copy. This is a *materialized snapshot ancestry chain*, not a
+claim that restores traverse 64 delta files. Initial base, native merging, copy
+and synchronization are charged inside creation time. Full mode remains
+selectable. All 64 child backing files remain until teardown: disk usage is
+not capped and must be budgeted before enabling Firecracker. For 512 MiB full
+snapshots the retained child files alone total 32 GiB; sparse/reflink allocations
+in diff mode depend on the actual populated data and filesystem.
+
+Outputs are under `results/depth/run-*`; `results/depth/latest` points to the
+latest attempt. Each `BACKEND/rep-NNN/` contains raw JSONL/CSV, process logs and
+a summary. The suite also records settings, binary hashes, preflight, launcher
+status, and creates `dashboard.html`, `report.md`, `comparison.json`, and the
+plot-ready `depth.csv`. One sample per repetition/depth contributes to the
+aggregate. With ten repetitions the nearest-rank p99 equals the maximum; it is
+not a reliable tail estimate. Failed/incomplete chains are rejected by reporting.
+
+Regenerate reports without running VMs:
+
+```sh
+./scripts/run-depth-suite.sh --report-only results/depth/latest
+```
+
+The dashboard is a portable table of measurements; the CSV preserves numeric
+precision for subsequent plotting of actual KVM results. Simulated tests and
+preflight output are not empirical latency or memory results.

@@ -23,6 +23,7 @@ public:
     ManagedBackend(const Options& options, fs::path work);
     void marker(const VmHandle& root, int round) override;
     Object ready(const VmHandle& vm) override;
+    Object command(const VmHandle& vm, const std::string& request) override;
     json::array cleanup() override;
 protected:
     pid_t launch(const std::vector<std::string>& arguments, const std::string& log_label);
@@ -240,6 +241,7 @@ void ManagedBackend::marker(const VmHandle& root, int round) {
     guest_request(root->vsock, "SET " + std::to_string(round));
 }
 Object ManagedBackend::ready(const VmHandle& vm) { return guest_request(vm->vsock); }
+Object ManagedBackend::command(const VmHandle& vm, const std::string& request) { return guest_request(vm->vsock, request); }
 pid_t ManagedBackend::launch(const std::vector<std::string>& arguments, const std::string& log_label) {
     return processes_.launch(arguments, options_.output / (log_label + ".log"));
 }
@@ -386,7 +388,7 @@ Object FirecrackerBackend::snapshot_metadata(const SnapshotFiles& files, uint64_
     require(stat(files.memory.c_str(), &metadata) == 0, "Cannot stat snapshot");
     return {{"mechanism", options_.snapshot_type == "diff" ? "fresh KVM dirty-page diff and materialized restore" : "fresh full snapshot and restore"},
         {"snapshot_type", options_.snapshot_type}, {"track_dirty_pages", options_.snapshot_type == "diff"},
-        {"child_track_dirty_pages", false}, {"snapshot_policy", "per-fork"},
+        {"child_track_dirty_pages", options_.experiment == "depth" && options_.snapshot_type == "diff"}, {"snapshot_policy", "per-fork"},
         {"preparation_included_in_guest_ready", true}, {"prepare_ns", elapsed_ns},
         {"snapshot_path", files.state.string()}, {"snapshot_memory_path", files.memory.string()},
         {"snapshot_state_bytes", fs::file_size(files.state)}, {"snapshot_memory_bytes", static_cast<uint64_t>(metadata.st_size)},
@@ -428,7 +430,8 @@ CloneResult FirecrackerBackend::clone(const VmHandle& root, int id) {
     auto child = start_process(id);
     firecracker_request(child->control, "PUT", "/snapshot/load", {{"snapshot_path", files.state.string()},
         {"mem_backend", Object{{"backend_type", "File"}, {"backend_path", files.memory.string()}}},
-        {"vsock_override", Object{{"uds_path", child->vsock.string()}}}, {"track_dirty_pages", false}, {"resume_vm", true}});
+        {"vsock_override", Object{{"uds_path", child->vsock.string()}}},
+        {"track_dirty_pages", options_.experiment == "depth" && options_.snapshot_type == "diff"}, {"resume_vm", true}});
     return {child, std::move(metadata)};
 }
 void FirecrackerBackend::remove_socket_files(const VmHandle& vm) const {
