@@ -79,7 +79,8 @@ Recorder::Recorder(const Options& options)
     require(bool(raw_), "Cannot open raw measurement output");
 }
 Object Recorder::collect_event(const MeasurementEvent& event) const {
-    auto sample = collector_.collect(event.vms, event.phase != "child_ready" && event.phase != "depth_ready");
+    auto sample = collector_.collect(event.vms, event.phase != "child_ready" && event.phase != "depth_ready" &&
+        event.phase != "sibling_ready" && event.phase != "footprint_sample");
     sample["phase"] = event.phase;
     sample["round"] = event.round;
     sample["position"] = event.position;
@@ -94,7 +95,9 @@ void Recorder::write_json(const Object& sample) {
 }
 void Recorder::print_progress(const MeasurementEvent& event, const Object& sample) const {
     if (event.phase == "child_ready" && event.position != options_.per_round) return;
-    std::cout << event.phase << " round=" << event.round << " forks=" << event.fork_number << " live=" << event.vms.size()
+    std::cout << event.phase;
+    if (event.phase == "footprint_sample") std::cout << " second=" << event.position;
+    std::cout << " round=" << event.round << " forks=" << event.fork_number << " live=" << event.vms.size()
         << " PSS_KiB=" << integer(sample.at("memory_sum_kib").as_object().at("Pss")) << std::endl;
 }
 void Recorder::record(const MeasurementEvent& event) {
@@ -451,7 +454,21 @@ void generate_saved_report(const fs::path& directory, const fs::path& dashboard_
 
 namespace vmbench {
 namespace {
-using DepthSeries = std::map<std::string, std::map<int, Series>>;
+using Figure4Series = std::map<std::string, std::map<int, Series>>;
+
+void validate_processes(const Object& sample, std::vector<int64_t>& retained_pids) {
+    const auto& processes = sample.at("processes").as_array();
+    require(processes.size() == static_cast<size_t>(integer(sample.at("live_vms"))), "Process count differs from live VMs");
+    std::set<int64_t> pids;
+    for (size_t i = 0; i < processes.size(); ++i) {
+        const auto& process = processes[i].as_object();
+        const auto pid = integer(process.at("pid"));
+        require(integer(process.at("vm_id")) == static_cast<int64_t>(i) && pid > 0 && pids.insert(pid).second,
+            "VM IDs or PIDs are inconsistent");
+        if (i == retained_pids.size()) retained_pids.push_back(pid);
+        require(retained_pids[i] == pid, "Retained VM PID changed within the run");
+    }
+}
 
 int expected_depth_sample(const Object& sample, size_t index, int maximum_depth) {
     std::string phase;
@@ -472,15 +489,6 @@ int expected_depth_sample(const Object& sample, size_t index, int maximum_depth)
         integer(sample.at("position")) == depth && integer(sample.at("live_vms")) == live &&
         integer(sample.at("fork_number")) == (phase == "all_stopped" ? maximum_depth : depth),
         "Depth lifecycle is incomplete or out of order");
-    const auto& processes = sample.at("processes").as_array();
-    require(processes.size() == static_cast<size_t>(live), "Depth process count differs from live VMs");
-    std::set<int64_t> pids;
-    for (size_t i = 0; i < processes.size(); ++i) {
-        const auto& process = processes[i].as_object();
-        const auto pid = integer(process.at("pid"));
-        require(integer(process.at("vm_id")) == static_cast<int64_t>(i) && pid > 0 && pids.insert(pid).second,
-            "Depth ancestry IDs or PIDs are inconsistent");
-    }
     return depth;
 }
 
@@ -498,41 +506,56 @@ void collect_depth_memory(const Object& sample, Series& series, const std::strin
     }
     series[prefix + "chain_pss_mib"].push_back(integer(sample.at("memory_sum_kib").as_object().at("Pss")) / 1024.0);
 }
+void collect_cxl_memory(const Object& extra, Series& series, int memory_mib, const std::string& prefix) {
+    const auto& usage = extra.at("cxl").as_object();
+    validate_cxl_usage(usage, memory_mib, false);
+    series[prefix + "cxl_frozen_mib"].push_back(integer(usage.at("frozen")) / 1048576.0);
+    series[prefix + "cxl_dram_overlay_mib"].push_back(integer(usage.at("private")) / 1048576.0);
+}
 
-void validate_depth_snapshot(const Object& metadata, int depth, const Object& settings,
+void validate_figure4_snapshot(const Object& metadata, int fork, const Object& settings,
     std::set<std::string>& backing_paths, std::string& base_path) {
     const auto type = text(settings.at("snapshot_type"));
     const bool diff = type == "diff";
     require(text(metadata.at("snapshot_type")) == type && metadata.at("track_dirty_pages").as_bool() == diff &&
-        metadata.at("child_track_dirty_pages").as_bool() == diff &&
+        metadata.at("child_track_dirty_pages").as_bool() == (diff && text(settings.at("experiment")) == "depth") &&
         metadata.at("sync_snapshot_files").as_bool() && metadata.at("preparation_included_in_guest_ready").as_bool(),
-        "Depth snapshot tracking, synchronization or timing policy is inconsistent");
+        "Figure 4 snapshot tracking, synchronization or timing policy is inconsistent");
     const auto path = text(metadata.at("snapshot_memory_path"));
     require(backing_paths.insert(path).second && integer(metadata.at("snapshot_memory_bytes")) ==
-        integer(settings.at("memory_mib")) * 1048576, "Depth backing reused or configured size changed");
+        integer(settings.at("memory_mib")) * 1048576, "Figure 4 backing reused or configured size changed");
     const auto prepare = integer(metadata.at("prepare_ns"));
     require(prepare >= 0 && integer(metadata.at("capture_ns")) >= 0 && integer(metadata.at("capture_ns")) <= prepare,
-        "Invalid depth capture timing");
+        "Invalid snapshot capture timing");
     if (!diff) return;
     const auto base = text(metadata.at("base_memory_path"));
-    if (depth == 1) base_path = base;
+    if (fork == 1) base_path = base;
     const auto method = text(metadata.at("snapshot_copy_method"));
-    require(base == base_path && base != path && metadata.at("initial_base").as_bool() == (depth == 1) &&
+    require(base == base_path && base != path && metadata.at("initial_base").as_bool() == (fork == 1) &&
         (method == "reflink" || method == "sparse-copy") &&
         integer(metadata.at("backing_copy_ns")) >= 0 &&
         integer(metadata.at("capture_ns")) + integer(metadata.at("backing_copy_ns")) <= prepare,
-        "Invalid depth diff base, copy method or preparation accounting");
+        "Invalid diff base, copy method or preparation accounting");
+}
+
+Object read_figure4_summary(const fs::path& directory, const Object& settings, const std::string& backend) {
+    const auto summary = read_object(directory / "summary.json");
+    require(text(summary.at("status")) == "ok" && summary.at("cleanup_errors").as_array().empty() &&
+        summary.at("experiment") == settings.at("experiment") && text(summary.at("backend")) == backend,
+        "Figure 4 run failed or cleanup is incomplete: " + directory.string());
+    const auto& preflight = summary.at("preflight").as_object();
+    for (const auto* key : {"populate_mib", "memory_mib", "vcpus", "huge_pages", "settle_ms"})
+        require(preflight.at(key) == settings.at(key), "Figure 4 settings differ: " + std::string(key));
+    if (backend == "lightning-cxl") require(preflight.at("cxl") == settings.at("cxl"), "CXL backing settings differ");
+    return summary;
 }
 
 Object analyze_depth_chain(const fs::path& directory, const Object& settings, const std::string& backend,
     std::map<int, Series>& series) {
-    const auto summary = read_object(directory / "summary.json");
-    require(text(summary.at("status")) == "ok" && summary.at("cleanup_errors").as_array().empty() &&
-        text(summary.at("experiment")) == "depth" && text(summary.at("backend")) == backend,
-        "Depth chain failed or cleanup is incomplete: " + directory.string());
-    const auto& preflight = summary.at("preflight").as_object();
-    for (const auto* key : {"depth", "populate_mib", "memory_mib", "vcpus", "huge_pages", "settle_ms"})
-        require(preflight.at(key) == settings.at(key), "Depth settings differ: " + std::string(key));
+    const auto summary = read_figure4_summary(directory, settings, backend);
+    require(summary.at("preflight").as_object().at("depth") == settings.at("depth"), "Depth settings differ");
+    const bool cxl = backend == "lightning-cxl";
+    const auto memory_mib = static_cast<int>(integer(settings.at("memory_mib")));
     const int maximum_depth = static_cast<int>(integer(settings.at("depth")));
     const auto& result = summary.at("result").as_object();
     require(integer(result.at("depth_completed")) == maximum_depth && integer(result.at("forks_completed")) == maximum_depth &&
@@ -553,15 +576,11 @@ Object analyze_depth_chain(const fs::path& directory, const Object& settings, co
         const auto time = integer(sample.at("monotonic_ns"));
         require(time >= previous_time, "Depth sample clock moved backwards"); previous_time = time;
         const auto phase = text(sample.at("phase"));
-        const auto& processes = sample.at("processes").as_array();
-        for (size_t i = 0; i < processes.size(); ++i) {
-            const auto pid = integer(processes[i].as_object().at("pid"));
-            if (i == lineage_pids.size()) lineage_pids.push_back(pid);
-            require(lineage_pids[i] == pid, "Retained ancestor PID changed within the chain");
-        }
+        validate_processes(sample, lineage_pids);
         const auto& extra = sample.at("extra").as_object();
         if (phase == "root_ready") {
             require(extra.at("population_verified").as_bool(), "Root population was not verified");
+            if (cxl) validate_cxl_usage(extra.at("cxl").as_object(), memory_mib, true);
             if (const auto huge = newest_memory(sample).if_contains("AnonHugePages")) root_huge = *huge;
         } else if (phase == "depth_ready") {
             require(integer(extra.at("depth")) == depth && integer(extra.at("source_id")) == depth - 1 &&
@@ -571,18 +590,25 @@ Object analyze_depth_chain(const fs::path& directory, const Object& settings, co
             require(ready >= returned && returned >= 0, "Depth readiness timing is invalid");
             const auto& metadata = extra.at("backend_metadata").as_object();
             if (backend == "firecracker") {
-                validate_depth_snapshot(metadata, depth, settings, backing_paths, base_path);
+                validate_figure4_snapshot(metadata, depth, settings, backing_paths, base_path);
                 require(integer(metadata.at("prepare_ns")) <= ready, "Snapshot preparation is outside readiness timing");
             }
             auto& values = series[depth];
             values["guest_ready_ms"].push_back(ready / 1e6);
             values["fork_return_ms"].push_back(returned / 1e6);
             if (const auto pause = metadata.if_contains("parent_pause_us")) values["parent_pause_ms"].push_back(integer(*pause) / 1000.0);
+            if (cxl) {
+                validate_cxl_fork(metadata, memory_mib, depth);
+                values["cxl_freeze_ms"].push_back(integer(metadata.at("cxl_freeze_us")) / 1000.0);
+                values["cxl_newly_frozen_bytes"].push_back(integer(metadata.at("cxl_frozen_bytes")));
+                collect_cxl_memory(extra, values, memory_mib, "ready_");
+            }
             collect_depth_memory(sample, values, "ready_");
         } else if (phase == "depth_verified") {
             require(integer(extra.at("depth")) == depth && extra.at("scan_verified").as_bool() && extra.at("isolation_verified").as_bool(),
                 "Depth scan or write isolation failed");
             collect_depth_memory(sample, series[depth], "verified_");
+            if (cxl) collect_cxl_memory(extra, series[depth], memory_mib, "verified_");
         } else if (phase == "lineage_verified") {
             require(extra.at("ancestors_retained").as_bool(), "Retained lineage was not verified");
         } else if (phase == "all_stopped") {
@@ -595,7 +621,105 @@ Object analyze_depth_chain(const fs::path& directory, const Object& settings, co
         {"root_anon_huge_kib", root_huge}, {"final_sec_pagetables", final_kvm}, {"samples", index}};
 }
 
-Object summarize_depth_values(const Series& series) {
+Object analyze_footprint(const fs::path& directory, const Object& settings, const std::string& backend,
+    int repetition, std::map<int, Series>& series, std::ostream& csv) {
+    const auto summary = read_figure4_summary(directory, settings, backend);
+    const auto& preflight = summary.at("preflight").as_object();
+    require(preflight.at("children") == settings.at("children") && preflight.at("duration_s") == settings.at("duration_s"),
+        "Footprint cohort settings differ");
+    const int children = static_cast<int>(integer(settings.at("children")));
+    const int duration = static_cast<int>(integer(settings.at("duration_s")));
+    const int memory_mib = static_cast<int>(integer(settings.at("memory_mib")));
+    const bool cxl = backend == "lightning-cxl";
+    const auto& result = summary.at("result").as_object();
+    require(integer(result.at("forks_completed")) == children && integer(result.at("samples_completed")) == duration &&
+        integer(result.at("maximum_live_vms")) == children + 1 && integer(result.at("final_live_vms")) == children + 1,
+        "Footprint summary does not match the retained cohort");
+
+    std::ifstream input(directory / "samples.jsonl");
+    require(bool(input), "Cannot read footprint samples");
+    std::vector<int64_t> retained_pids;
+    int64_t previous_time = -1;
+    auto read_sample = [&](const char* phase, int position, int forks, int live) {
+        std::string line;
+        require(bool(std::getline(input, line)), "Footprint stream is incomplete");
+        const auto sample = json::parse(line).as_object();
+        require(text(sample.at("phase")) == phase && integer(sample.at("round")) == 0 &&
+            integer(sample.at("position")) == position && integer(sample.at("fork_number")) == forks &&
+            integer(sample.at("live_vms")) == live, "Footprint samples are out of order or incomplete");
+        const auto time = integer(sample.at("monotonic_ns"));
+        require(time >= previous_time, "Footprint sample clock moved backwards");
+        previous_time = time;
+        validate_processes(sample, retained_pids);
+        return sample;
+    };
+    read_sample("before_boot", 0, 0, 0);
+    const auto root = read_sample("root_ready", 0, 0, 1);
+    const auto& root_extra = root.at("extra").as_object();
+    require(root_extra.at("population_verified").as_bool(), "Footprint root population was not verified");
+    if (cxl) validate_cxl_usage(root_extra.at("cxl").as_object(), memory_mib, true);
+
+    std::set<std::string> backing_paths;
+    std::string base_path;
+    for (int child = 1; child <= children; ++child) {
+        const auto sample = read_sample("sibling_ready", child, child, child + 1);
+        const auto& extra = sample.at("extra").as_object();
+        require(integer(extra.at("source_id")) == 0 && integer(extra.at("child_id")) == child &&
+            extra.at("inheritance_verified").as_bool(), "Footprint child did not inherit from the root");
+        const auto ready = integer(extra.at("guest_ready_ns")), returned = integer(extra.at("fork_return_ns"));
+        require(ready >= returned && returned >= 0, "Invalid footprint child timing");
+        const auto& metadata = extra.at("backend_metadata").as_object();
+        if (backend == "firecracker") {
+            validate_figure4_snapshot(metadata, child, settings, backing_paths, base_path);
+            require(integer(metadata.at("prepare_ns")) <= ready, "Snapshot preparation is outside readiness timing");
+        }
+        if (cxl) {
+            validate_cxl_fork(metadata, memory_mib, child);
+            validate_cxl_usage(extra.at("cxl").as_object(), memory_mib, false);
+        }
+    }
+
+    for (int second = 1; second <= duration; ++second) {
+        const auto sample = read_sample("footprint_sample", second, children, children + 1);
+        const auto& extra = sample.at("extra").as_object();
+        const auto elapsed = integer(extra.at("elapsed_ns"));
+        require(elapsed >= second * 1000000000LL && elapsed < (second + 1) * 1000000000LL,
+            "Footprint sample missed its one-second window");
+        const auto& processes = sample.at("processes").as_array();
+        const auto* usage = cxl ? &extra.at("cxl_children").as_array() : nullptr;
+        if (usage) require(usage->size() == static_cast<size_t>(children), "Missing CXL child accounting");
+        auto& values = series[second];
+        for (int child = 1; child <= children; ++child) {
+            const auto& process = processes[child].as_object();
+            const auto& memory = process.at("memory_kib").as_object();
+            const auto private_kib = integer(memory.at("Private_Dirty")) + integer(memory.at("Private_Clean"));
+            const auto pss_kib = integer(memory.at("Pss"));
+            values["private_mib"].push_back(private_kib / 1024.0);
+            values["pss_mib"].push_back(pss_kib / 1024.0);
+            csv << backend << ',' << repetition << ',' << second << ',' << elapsed << ',' << child << ','
+                << integer(process.at("pid")) << ',' << private_kib << ',' << pss_kib << ',';
+            if (const auto huge = memory.if_contains("AnonHugePages")) csv << integer(*huge);
+            csv << ',';
+            if (usage) {
+                const auto& vm_usage = (*usage)[child - 1].as_object();
+                require(integer(vm_usage.at("vm_id")) == child, "CXL accounting does not match the child");
+                validate_cxl_usage(vm_usage, memory_mib, false);
+                csv << integer(vm_usage.at("frozen")) << ',' << integer(vm_usage.at("private"));
+            } else csv << ',';
+            csv << '\n';
+        }
+    }
+    const auto verified = read_sample("footprint_verified", 0, children, children + 1);
+    require(verified.at("extra").as_object().at("isolation_verified").as_bool(), "Footprint write isolation was not verified");
+    const auto stopped = read_sample("all_stopped", 0, children, 0);
+    require(integer(stopped.at("memory_sum_kib").as_object().at("Pss")) == 0, "Stopped VMs still appear in process accounting");
+    std::string line;
+    require(!std::getline(input, line) && input.eof(), "Extra or unreadable samples after footprint teardown");
+    return {{"directory", directory.string()}, {"status", "ok"}, {"final_live_vms", 0},
+        {"children", children}, {"seconds_sampled", duration}, {"final_sec_pagetables", final_page_tables(stopped)}};
+}
+
+Object summarize_figure4_values(const Series& series) {
     Object result;
     for (const auto& [name, original] : series) {
         auto values = original;
@@ -611,10 +735,64 @@ Object summarize_depth_values(const Series& series) {
     return result;
 }
 
+void write_footprint_report(const fs::path& directory, const Object& settings, const json::array& rows, const std::string& csv) {
+    std::ostringstream html, markdown;
+    const std::string title = "Figure 4(a): child private memory over time";
+    std::ostringstream protocol;
+    protocol << integer(settings.at("children")) << " siblings per cohort, " << integer(settings.at("duration_s"))
+             << " one-second samples after each child modifies one byte in its inherited buffer. "
+                "The parent and children remain live for the full sampling window. "
+                "Private memory is Private_Clean plus Private_Dirty. PSS is shown separately. "
+                "Each row summarizes the children across the completed repetitions.";
+    if (const auto cxl = settings.if_contains("cxl")) {
+        protocol << " Lightning CXL uses a "
+                 << (text(cxl->as_object().at("backing")) == "devdax" ? "devdax pool." : "local file stand-in.")
+                 << " The CSV reports frozen and DRAM overlay bytes per child as mapping counts.";
+    }
+    html << "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>" << title << "</title>"
+         << "<style>body{font:16px system-ui;max-width:1000px;margin:40px auto}table{border-collapse:collapse;width:100%}"
+            "th,td{padding:8px;border-bottom:1px solid #ddd;text-align:left}</style>"
+         << "<h1>" << title << "</h1><p>" << protocol.str() << "</p>"
+            "<p><a href=\"footprint.csv\">Per-child CSV</a> · <a href=\"comparison.json\">Full metadata</a></p>"
+            "<table><thead><tr><th>Backend</th><th>Second</th><th>Samples</th><th>Private median MiB</th>"
+            "<th>Private max MiB</th><th>PSS median MiB</th></tr></thead><tbody>";
+    markdown << "# " << title << "\n\n" << protocol.str() << "\n\n"
+             << "[Per-child CSV](footprint.csv) · [Full metadata](comparison.json)\n\n"
+                "| Backend | Second | Samples | Private median MiB | Private max MiB | PSS median MiB |\n"
+                "|---|---:|---:|---:|---:|---:|\n";
+    for (const auto& entry : rows) {
+        const auto& row = entry.as_object();
+        const auto backend = text(row.at("backend"));
+        html << "<tr><td>" << backend << "</td>";
+        markdown << "| " << backend;
+        for (const auto* key : {"second", "private_mib_samples", "private_mib_median", "private_mib_max", "pss_mib_median"}) {
+            const auto value = display_number(row, key);
+            html << "<td>" << value << "</td>";
+            markdown << " | " << value;
+        }
+        html << "</tr>";
+        markdown << " |\n";
+    }
+    html << "</tbody></table></html>";
+    write_text(directory / "footprint.csv", csv);
+    write_text(directory / "dashboard.html", html.str());
+    write_text(directory / "report.md", markdown.str());
+}
+
 void write_depth_tables(const fs::path& directory, const Object& settings, const json::array& rows, const json::array& chains) {
     std::ostringstream csv, html, markdown;
+    const auto cxl = settings.if_contains("cxl");
     csv << "backend,depth,samples,guest_ready_ms_median,guest_ready_ms_p99,ready_private_mib_median,"
-           "ready_pss_mib_median,verified_private_mib_median,verified_pss_mib_median,ready_anon_huge_mib_median,parent_pause_ms_median\n";
+           "ready_pss_mib_median,verified_private_mib_median,verified_pss_mib_median,ready_anon_huge_mib_median,parent_pause_ms_median";
+    const std::vector<std::pair<const char*, const char*>> cxl_columns{
+        {"cxl_freeze_ms_median", "CXL freeze ms"},
+        {"cxl_newly_frozen_bytes_median", "Newly frozen bytes"},
+        {"ready_cxl_frozen_mib_median", "Frozen mapped MiB at ready"},
+        {"ready_cxl_dram_overlay_mib_median", "DRAM overlay MiB at ready"},
+        {"verified_cxl_frozen_mib_median", "Frozen mapped MiB after checks"},
+        {"verified_cxl_dram_overlay_mib_median", "DRAM overlay MiB after checks"}};
+    if (cxl) for (const auto& [key, label] : cxl_columns) csv << ',' << key;
+    csv << '\n';
     html << "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Figure 4(b): fork depth</title>"
             "<style>body{font:16px system-ui;max-width:1200px;margin:40px auto;padding:0 20px;color:#17232d}"
             "table{border-collapse:collapse;width:100%}td,th{padding:8px;border-bottom:1px solid #ddd;text-align:right}"
@@ -633,11 +811,24 @@ void write_depth_tables(const fs::path& directory, const Object& settings, const
     markdown << "# Figure 4(b): fork depth\n\nIndependent retained chains, immediate-parent state and private-write checks. "
                 "THP is requested; inspect observed AnonHugePages before claiming matched backing. "
                 "Nearest-rank p99 from ten repetitions equals the maximum and is not a stable tail estimate.\n\n";
-    const std::string header = "| Backend | Depth | Samples | Ready median ms | Ready p99 ms | Private ready MiB | PSS ready MiB | Private after checks MiB | AnonHugePages ready MiB |\n"
-                               "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n";
-    markdown << header;
+    if (cxl) {
+        const auto backing = text(cxl->as_object().at("backing")) == "devdax" ? "devdax pool" : "local file stand-in";
+        const auto note = "Frozen bytes and DRAM overlay bytes describe mappings in the newest VM. "
+                          "Do not add these across VMs to estimate physical memory. Overlay pages can remain shared through fork.";
+        html << "<p>Lightning CXL backing: " << backing << ". " << note << "</p>";
+        markdown << "Lightning CXL backing: " << backing << ". " << note << "\n\n";
+    }
+    markdown << "| Backend | Depth | Samples | Ready median ms | Ready p99 ms | Private ready MiB | PSS ready MiB | Private after checks MiB | AnonHugePages ready MiB";
     html << "<table><thead><tr><th>Backend</th><th>Depth</th><th>Samples</th><th>Ready median ms</th><th>Ready p99 ms</th>"
-            "<th>Private ready MiB</th><th>PSS ready MiB</th><th>Private after checks MiB</th><th>AnonHugePages ready MiB</th></tr></thead><tbody>";
+            "<th>Private ready MiB</th><th>PSS ready MiB</th><th>Private after checks MiB</th><th>AnonHugePages ready MiB</th>";
+    if (cxl) for (const auto& [key, label] : cxl_columns) {
+        markdown << " | " << label;
+        html << "<th>" << label << "</th>";
+    }
+    markdown << " |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|";
+    if (cxl) for (size_t i = 0; i < cxl_columns.size(); ++i) markdown << "---:|";
+    markdown << '\n';
+    html << "</tr></thead><tbody>";
     for (const auto& entry : rows) {
         const auto& row = entry.as_object();
         const auto backend = text(row.at("backend"));
@@ -647,7 +838,6 @@ void write_depth_tables(const fs::path& directory, const Object& settings, const
             csv << ',';
             if (const auto value = row.if_contains(key)) csv << json::serialize(*value);
         }
-        csv << '\n';
         markdown << "| " << backend;
         html << "<tr><td>" << backend << "</td>";
         for (const auto* key : {"depth", "guest_ready_ms_samples", "guest_ready_ms_median", "guest_ready_ms_p99", "ready_private_mib_median",
@@ -656,6 +846,14 @@ void write_depth_tables(const fs::path& directory, const Object& settings, const
             markdown << " | " << value;
             html << "<td>" << value << "</td>";
         }
+        if (cxl) for (const auto& [key, label] : cxl_columns) {
+            csv << ',';
+            if (const auto value = row.if_contains(key)) csv << json::serialize(*value);
+            const auto value = display_number(row, key);
+            markdown << " | " << value;
+            html << "<td>" << value << "</td>";
+        }
+        csv << '\n';
         markdown << " |\n"; html << "</tr>";
     }
     html << "</tbody></table><p>Validated chains: " << chains.size() << ". Every chain ended with zero live VMs.</p></html>";
@@ -665,41 +863,65 @@ void write_depth_tables(const fs::path& directory, const Object& settings, const
 }
 }
 
-void generate_depth_report(const fs::path& directory) {
-    require(fs::is_directory(directory), "Depth suite directory does not exist");
+void generate_figure4_report(const fs::path& directory) {
+    require(fs::is_directory(directory), "Figure 4 suite directory does not exist");
     const auto status_path = directory / "reporting-status.json";
     write_text(status_path, "{\"status\":\"running\",\"vm_runs_started\":0}\n");
     try {
         const auto settings = read_object(directory / "settings.json");
-        const auto depth = integer(settings.at("depth")), repetitions = integer(settings.at("repetitions"));
-        require(text(settings.at("experiment")) == "depth" && text(settings.at("huge_pages")) == "Transparent" &&
-            depth >= 1 && depth <= 64 && repetitions >= 1 && repetitions <= 1000,
-            "Invalid Figure 4(b) settings");
-        require(text(settings.at("snapshot_type")) == "full" || text(settings.at("snapshot_type")) == "diff", "Invalid depth snapshot mode");
+        const auto experiment = text(settings.at("experiment"));
+        const bool footprint = experiment == "footprint";
+        const auto repetitions = integer(settings.at("repetitions"));
+        require((experiment == "depth" || footprint) && text(settings.at("huge_pages")) == "Transparent" &&
+            repetitions >= 1 && repetitions <= 1000, "Invalid Figure 4 settings");
+        const auto points = integer(settings.at(footprint ? "duration_s" : "depth"));
+        const auto children = footprint ? integer(settings.at("children")) : 1;
+        require(points >= 1 && points <= (footprint ? 60 : 64) && children >= 1 && children <= 16,
+            "Invalid Figure 4 depth, cohort size or duration");
+        require(text(settings.at("snapshot_type")) == "full" || text(settings.at("snapshot_type")) == "diff", "Invalid snapshot mode");
         const auto& backends = settings.at("backends").as_array();
-        require(!backends.empty() && backends.size() <= 2, "Choose one or both supported depth backends");
+        require(!backends.empty() && backends.size() <= 3, "Choose up to three supported Figure 4 backends");
         std::set<std::string> identities;
-        DepthSeries series;
-        json::array chains, rows;
+        Figure4Series series;
+        json::array runs, rows;
+        std::ostringstream footprint_csv;
+        footprint_csv << "backend,repetition,second,elapsed_ns,child_id,pid,private_kib,pss_kib,anon_huge_kib,cxl_frozen_bytes,cxl_dram_overlay_bytes\n";
         for (const auto& value : backends) {
             const auto backend = text(value);
-            require((backend == "lightning" || backend == "firecracker") && identities.insert(backend).second,
-                "Unsupported or repeated depth backend");
+            require((backend == "lightning" || backend == "lightning-cxl" || backend == "firecracker") && identities.insert(backend).second,
+                "Unsupported or repeated Figure 4 backend");
+            if (backend == "lightning-cxl") {
+                const auto& cxl = settings.at("cxl").as_object();
+                const auto backing = text(cxl.at("backing"));
+                const auto pool = text(cxl.at("pool_path"));
+                const auto offset = integer(cxl.at("offset_bytes"));
+                require((backing == "devdax" && !pool.empty() && offset >= 0 && offset % (2 << 20) == 0) ||
+                        (backing == "file-standin" && pool.empty() && offset == 0), "Invalid saved CXL backing configuration");
+            }
             for (int repetition = 1; repetition <= repetitions; ++repetition) {
                 std::ostringstream name; name << "rep-" << std::setw(3) << std::setfill('0') << repetition;
-                auto chain = analyze_depth_chain(directory / backend / name.str(), settings, backend, series[backend]);
-                chain["backend"] = backend; chain["repetition"] = repetition; chains.push_back(std::move(chain));
+                const auto run_dir = directory / backend / name.str();
+                auto run = footprint ? analyze_footprint(run_dir, settings, backend, repetition, series[backend], footprint_csv)
+                                     : analyze_depth_chain(run_dir, settings, backend, series[backend]);
+                run["backend"] = backend;
+                run["repetition"] = repetition;
+                runs.push_back(std::move(run));
             }
-            for (int generation = 1; generation <= depth; ++generation) {
-                require(series[backend][generation]["guest_ready_ms"].size() == static_cast<size_t>(repetitions), "Missing depth repetition");
-                auto row = summarize_depth_values(series[backend][generation]);
-                row["backend"] = backend; row["depth"] = generation;
+            for (int point = 1; point <= points; ++point) {
+                auto& values = series[backend][point];
+                require(values[footprint ? "private_mib" : "guest_ready_ms"].size() == static_cast<size_t>(repetitions * children),
+                    "Missing Figure 4 measurements");
+                auto row = summarize_figure4_values(values);
+                row["backend"] = backend;
+                row[footprint ? "second" : "depth"] = point;
                 rows.push_back(std::move(row));
             }
         }
-        const Object report{{"experiment", "depth"}, {"validation", "passed"}, {"vm_runs_started", 0},
-            {"settings", settings}, {"chains", chains}, {"rows", rows}};
-        write_depth_tables(directory, settings, rows, chains);
+        require(identities.contains("lightning-cxl") == settings.contains("cxl"), "CXL settings must match selected backends");
+        const Object report{{"experiment", experiment}, {"validation", "passed"}, {"vm_runs_started", 0},
+            {"settings", settings}, {footprint ? "cohorts" : "chains", runs}, {"rows", rows}};
+        if (footprint) write_footprint_report(directory, settings, rows, footprint_csv.str());
+        else write_depth_tables(directory, settings, rows, runs);
         write_text(directory / "comparison.json", json::serialize(report) + "\n");
         write_text(status_path, "{\"status\":\"ok\",\"vm_runs_started\":0}\n");
     } catch (const std::exception& error) {

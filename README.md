@@ -351,14 +351,48 @@ benchmark reports may describe superseded lifecycle restrictions.
 - [KVM API and statistics](https://docs.kernel.org/virt/kvm/api.html)
 - [Boost.JSON header-only build](https://www.boost.org/doc/libs/1_89_0/libs/json/doc/html/index.html#json.overview.header_only)
 
+## Figure 4(a): child private memory over time
+
+The Figure 4 runner also supports a retained cohort of **16 siblings from one
+parent**. Each child verifies the inherited buffer and writes one byte after
+all children are ready. The controller verifies the parent's state and each
+child's distinct marker, lets the cohort settle, then samples every child once
+per second for 60 seconds. The parent and all 16 children stay alive through
+the final isolation check. This controlled write followed by idle sampling is
+the initial workload while the agent workload is TBD.
+
+Use the same prepared VMMs, guest images, CXL device settings and tracing access
+as for the depth experiment below. For the three-backend comparison, run from
+the project directory with `pool_device` and `pool_offset` set to your reserved
+devdax range:
+
+```sh
+VM_BENCH_EXPERIMENT=footprint \
+VM_BENCH_BACKENDS="lightning lightning-cxl firecracker" \
+VM_BENCH_CXL_POOL="$pool_device" VM_BENCH_CXL_OFFSET="$pool_offset" \
+  ./scripts/run-depth-suite.sh
+```
+
+Defaults are one cohort per backend, 512 MiB RAM, 128 MiB populated and one
+vCPU with Transparent huge pages requested. Set `VM_BENCH_CHILDREN=2` and
+`VM_BENCH_DURATION_S=3` for a short smoke test. For Firecracker, each sibling
+uses a synchronized snapshot of the root with its own backing. Restored
+siblings can use ordinary memory without dirty tracking because they are
+leaves in this experiment.
+
+Read `results/footprint/latest/footprint.csv` for each child's private memory,
+PSS, anonymous huge pages and CXL mapping counters when applicable. The CSV
+includes actual elapsed nanoseconds and scheduled seconds. The dashboard
+summarizes per-child values at each second. The reporter checks sample
+coverage, stable cohort membership and teardown. Regenerate with
+`./scripts/run-depth-suite.sh --report-only results/footprint/latest`.
+
 ## Figure 4(b): latency and private memory versus fork depth
 
-This implements the **Lightning/Firecracker baseline and pre-CXL validation**
-for Figure 4(b). It does not implement Skyfall's CXL memory backing or cross-host
-sharing. Successful runs validate the existing VM paths and measurement
-controller; final Skyfall measurements require its CXL implementation and
-additional backing/sharing checks. Figures 3 and 4(a) are not implemented by
-this depth runner.
+Both Figure 4 modes support Lightning with anonymous DRAM, Lightning with its
+CXL pool, and Firecracker snapshot/restore. The CXL path uses the same-host
+fork mechanism in the updated Lightning source. Figure 3 has a separate
+fan-out and readiness protocol.
 
 This is a separate experiment from the 50-sibling batch suite. Each independent
 chain forks its newest VM, retains every ancestor, and ends at depth 64 (65 live
@@ -407,9 +441,8 @@ TMPDIR="$PWD/build/tmp" CCACHE_DISABLE=1 make -B check
 
 The script must run from a normal Linux host terminal with KVM access. It uses
 prepared VMMs under `build/vmm`, the existing guest kernel/initramfs under
-`build/guest`, and project-local temporary files under `build/w`. It does not
-require CXL, RDMA, additional network setup or writable VM disk images. It does
-not modify the Lightning or Firecracker source checkouts or build either VMM.
+`build/guest`, and project-local temporary files under `build/w`. The DRAM and
+Firecracker paths run without a CXL device. Preparation builds the VMMs separately.
 The guest must implement `ALLOC`, `SET`, `WRITE`, `GET`, and `SCAN` as in the
 prepared minimal guest; an initial checksum check rejects incompatible guests.
 Build prerequisites remain Make, a C++20 compiler and Boost.JSON. Building the
@@ -427,6 +460,53 @@ VM_BENCH_MEMORY_MIB=4096 VM_BENCH_POPULATE_MIB=1024 VM_BENCH_VCPUS=8 \
 # Optional matching Firecracker baseline, run after Lightning (not concurrently).
 VM_BENCH_BACKENDS="lightning firecracker" ./scripts/run-depth-suite.sh
 ```
+
+### Lightning with a CXL pool
+
+With the normal preparation artifacts and Rust dependencies already cached,
+build the CXL revision from the local source export. Run these commands in the
+benchmark project:
+
+```sh
+source_dir="$HOME/Projects/lightning-cxl-lightning"
+CARGO_HOME="$PWD/build/deps/cargo" RUSTUP_HOME="$PWD/build/deps/rustup" \
+RUSTUP_TOOLCHAIN=1.97.0 CARGO_TARGET_DIR="$PWD/build/vmm/lightning-cxl" \
+TMPDIR="$PWD/build/tmp" CCACHE_DISABLE=1 \
+  "$PWD/build/deps/cargo/bin/cargo" build --offline --locked --release -j 4 \
+  --manifest-path "$source_dir/Cargo.toml" --config "$source_dir/.cargo/config.toml" -p lightning
+```
+
+Run with KVM access and permission to use the `kvm:kvm_page_fault` tracepoint
+through tracefs and perf (the upstream workflow runs as root). For hardware,
+set `pool_device` to a verified CXL devdax device and `pool_offset` to the
+start of an exclusively reserved range, in bytes. The device must have 2 MiB
+alignment. Offset and guest size must be multiples of 2 MiB.
+**Lightning zeroes the configured range at every root boot.**
+Reserve at least the configured guest RAM size. Lightning's range lock
+coordinates Lightning instances on the same host, so keep other users of the
+range out of it.
+
+```sh
+VM_BENCH_BACKENDS=lightning-cxl \
+VM_BENCH_CXL_POOL="$pool_device" VM_BENCH_CXL_OFFSET="$pool_offset" \
+VM_BENCH_DEPTH=64 VM_BENCH_REPETITIONS=10 \
+  ./scripts/run-depth-suite.sh
+```
+
+For a protocol smoke test with a private temporary file, use
+`VM_BENCH_BACKENDS=lightning-cxl VM_BENCH_CXL_STANDIN=1 VM_BENCH_DEPTH=4 VM_BENCH_REPETITIONS=1 ./scripts/run-depth-suite.sh`.
+The report labels it a file stand-in. It still needs KVM and tracing access.
+Selecting both `lightning` and `lightning-cxl` uses the same CXL-capable
+binary for both cases. Override its path with `VM_BENCH_LIGHTNING` and its
+source record with `VM_BENCH_LIGHTNING_SOURCE` if needed.
+
+The controller verifies writable pool backing before the first fork,
+full-size first freeze, zero newly frozen bytes at later depths, and a
+nonempty frozen mapping in each descendant. It records Lightning's freeze
+time and per-VM frozen and DRAM overlay bytes alongside the existing
+inheritance and isolation checks. These counters describe mappings. An
+overlay inherited by another fork can still be physically shared. The
+status requests run outside fork and guest-ready timing.
 
 Other settings: `VM_BENCH_DEPTH` (1–64), `VM_BENCH_REPETITIONS` (1–1000),
 `VM_BENCH_SETTLE_MS` (default 200), `VM_BENCH_SNAPSHOT_TYPE` (`diff` or `full`),

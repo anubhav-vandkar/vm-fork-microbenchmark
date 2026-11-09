@@ -80,3 +80,17 @@ table and numeric CSV. It does not reuse the sibling-batch validator or relabel
 historical measurements. Ten repetitions provide ten samples per depth, not
 640 samples for each depth's p99. Anonymous huge-page observations are explicit;
 requesting THP is not taken as evidence of actual guest-VMA coverage.
+
+Lightning CXL reuses the Lightning live backend. It adds the `cxl` section to
+the root VM's boot configuration and reads CXL chunk usage through the
+existing status RPC. The depth controller checks first-fork freeze and
+descendant backing outside the timer. The depth reporter validates those
+observations and identifies devdax versus the private file stand-in.
+
+The Figure 4(a) controller uses the same guest population, state checks and
+backends. It creates siblings from the original root, applies the private
+write probe, and keeps the cohort alive while sampling on absolute one-second
+deadlines. The runner selects `footprint` or `depth` and records them in
+separate result directories. The shared Figure 4 report entry point checks
+stable process identity and backend metadata, then validates either the
+cohort time series or the retained lineage before writing its report.

@@ -728,7 +728,7 @@ void test_firecracker_diff_snapshots() {
 
 namespace vmbench::tests {
 namespace {
-class DepthFake final : public Backend {
+class Figure4Fake final : public Backend {
 public:
     VmHandle boot() override {
         auto vm = std::make_shared<Vm>(); vm->pid = 10000;
@@ -745,7 +745,7 @@ public:
         if (request.starts_with("ALLOC ")) { state.mib = std::stoi(request.substr(6)); state.first = 1; }
         else if (request.starts_with("WRITE ")) {
             state.first = std::stoi(request.substr(6));
-            if (shared_writes && vm->id > 0) states.at(vm->id - 1).first = state.first;
+            if (shared_writes && vm->id > 0) states.at(siblings ? 0 : vm->id - 1).first = state.first;
         }
         auto result = ready(vm);
         if (request == "SCAN") result["checksum"] = populated_checksum(state.mib) - 1 + state.first + (bad_scan && vm->id > 0);
@@ -753,18 +753,29 @@ public:
     }
     Object prepare_round(const VmHandle&, int) override { throw std::runtime_error("Depth unexpectedly used batch preparation"); }
     CloneResult clone(const VmHandle& source, int id) override {
-        require(source == nodes.back() && source->id == id - 1 &&
+        require(source == (siblings ? nodes.front() : nodes.back()) && source->id == (siblings ? 0 : id - 1) &&
             std::all_of(nodes.begin(), nodes.end(), [](const auto& vm) { return vm->alive; }),
-            "Depth did not retain ancestors or clone the immediate predecessor");
+            "Figure 4 run did not retain VMs or fork the expected source");
         auto vm = std::make_shared<Vm>(); vm->id = id; vm->pid = 10000 + id;
         states[id] = states.at(wrong_source ? 0 : source->id); nodes.push_back(vm);
-        return {vm, {{"parent_pause_us", 10}}};
+        Object metadata{{"parent_pause_us", 10}};
+        if (cxl_memory_mib) {
+            metadata["cxl_freeze_us"] = id == 1 ? 10 : 0;
+            metadata["cxl_frozen_bytes"] = id == 1 ? cxl_memory_mib * 1048576LL : 0;
+        }
+        return {vm, std::move(metadata)};
+    }
+    Object cxl_usage(const VmHandle&) override {
+        const auto bytes = cxl_memory_mib * 1048576LL;
+        if (nodes.size() == 1) return {{"writable", bytes}, {"frozen", 0}, {"private", 0}};
+        return {{"writable", 0}, {"frozen", bytes - 2097152}, {"private", 2097152}};
     }
     void destroy(const VmHandle& vm) override { vm->alive = false; }
     void release_round(const VmHandle&) override { throw std::runtime_error("Depth unexpectedly used batch cleanup"); }
     json::array cleanup() override { for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) destroy(*it); return {}; }
     VmList nodes;
-    bool shared_writes = false, bad_scan = false, wrong_source = false;
+    int cxl_memory_mib = 0;
+    bool siblings = false, shared_writes = false, bad_scan = false, wrong_source = false;
 private:
     struct State { int counter, mib, first; };
     std::map<int, State> states;
@@ -792,7 +803,7 @@ void require_socket_access() {
 }
 void test_depth_lifecycle() {
     Options options; options.experiment = "depth"; options.settle_ms = 0;
-    DepthFake backend;
+    Figure4Fake backend;
     int ready = 0, verified = 0;
     DepthBenchmark benchmark(backend, options, [&](const MeasurementEvent& event) {
         require(event.vms.size() == static_cast<size_t>(event.position + 1), "Depth live count differs from ancestry");
@@ -807,7 +818,7 @@ void test_depth_lifecycle() {
 void test_depth_validation() {
     for (int failure = 0; failure < 3; ++failure) {
         Options options; options.experiment = "depth"; options.depth = 4; options.settle_ms = 0;
-        DepthFake backend;
+        Figure4Fake backend;
         backend.shared_writes = failure == 0; backend.bad_scan = failure == 1; backend.wrong_source = failure == 2;
         bool rejected = false;
         try { DepthBenchmark benchmark(backend, options, [](const MeasurementEvent&) {}); benchmark.run(); }
@@ -821,33 +832,54 @@ void test_depth_cli() {
     require(options.experiment == "depth" && options.depth == 64 && options.huge_pages == "Transparent" &&
         integer(inspect_host(options).at("total_forks")) == 64 && integer(inspect_host(options).at("maximum_live_vms")) == 65,
         "Depth CLI defaults or planned counts are wrong");
-    require(parse({"benchmark", "--depth-report", "."}).command == Command::DepthReport, "Depth report requires KVM or run parsing");
+    require(parse({"benchmark", "--depth-report", "."}).command == Command::Figure4Report, "Depth report requires KVM or run parsing");
+    const auto cxl = parse({"benchmark", "--experiment", "depth", "--backend", "lightning-cxl",
+        "--cxl-pool", "/dev/dax0.0", "--cxl-offset", "68719476736"});
+    require(integer(inspect_host(cxl).at("cxl").as_object().at("offset_bytes")) == 68719476736LL,
+        "CXL range offset was lost in preflight");
+    const auto footprint = parse({"benchmark", "--experiment", "footprint", "--backend", "lightning-cxl", "--cxl-standin"});
+    const auto footprint_plan = inspect_host(footprint);
+    require(integer(footprint_plan.at("total_forks")) == 16 && integer(footprint_plan.at("maximum_live_vms")) == 17 &&
+        integer(footprint_plan.at("duration_s")) == 60 && footprint.huge_pages == "Transparent",
+        "Figure 4(a) defaults do not match the cohort procedure");
     for (const auto& arguments : std::vector<std::vector<std::string>>{
         {"benchmark", "--experiment", "depth", "--depth", "65"},
         {"benchmark", "--experiment", "depth", "--depth", "0"},
         {"benchmark", "--experiment", "depth", "--populate-mib", "256"},
         {"benchmark", "--experiment", "depth", "--huge-pages", "None"},
-        {"benchmark", "--experiment", "invalid"}}) {
+        {"benchmark", "--experiment", "invalid"},
+        {"benchmark", "--experiment", "footprint", "--duration-s", "61"},
+        {"benchmark", "--experiment", "footprint", "--children", "0"},
+        {"benchmark", "--backend", "lightning", "--cxl-standin"},
+        {"benchmark", "--backend", "lightning-cxl", "--cxl-standin"},
+        {"benchmark", "--experiment", "depth", "--backend", "lightning-cxl", "--cxl-pool", "/dev/dax0.0"},
+        {"benchmark", "--experiment", "depth", "--backend", "lightning-cxl", "--cxl-pool", "/dev/dax0.0", "--cxl-offset", "4096"},
+        {"benchmark", "--experiment", "depth", "--backend", "lightning-cxl", "--cxl-standin", "--memory-mib", "257"}}) {
         bool rejected = false;
         try { parse(arguments); } catch (const std::runtime_error&) { rejected = true; }
         require(rejected, "Invalid Figure 4(b) parameters accepted");
     }
 }
-void test_depth_reporting() {
+void check_depth_reporting(const std::string& backend_name) {
     TemporaryDirectory temporary(fs::temp_directory_path());
     Options options; options.experiment = "depth"; options.depth = 3; options.settle_ms = 0; options.huge_pages = "Transparent";
-    const Object settings{{"experiment", "depth"}, {"depth", 3}, {"populate_mib", 64}, {"memory_mib", 256},
+    options.backend = backend_name;
+    options.cxl_standin = backend_name == "lightning-cxl";
+    Object settings{{"experiment", "depth"}, {"depth", 3}, {"populate_mib", 64}, {"memory_mib", 256},
         {"vcpus", 1}, {"huge_pages", "Transparent"}, {"settle_ms", 0}, {"repetitions", 2},
-        {"snapshot_type", "diff"}, {"backends", json::array{"lightning"}}};
+        {"snapshot_type", "diff"}, {"backends", json::array{backend_name}}};
+    if (options.cxl_standin) settings["cxl"] = inspect_host(options).at("cxl");
     write_text(temporary.path() / "settings.json", json::serialize(settings));
-    const auto output = temporary.path() / "lightning/rep-001";
+    const auto output = temporary.path() / backend_name / "rep-001";
+    const auto second_output = output.parent_path() / "rep-002";
     fs::create_directories(output);
     std::vector<Object> samples{depth_sample({"before_boot", 0, 0, 0, {}, {}}, 0)};
-    DepthFake backend;
+    Figure4Fake backend;
+    if (options.cxl_standin) backend.cxl_memory_mib = options.memory_mib;
     DepthBenchmark benchmark(backend, options, [&](const MeasurementEvent& event) { samples.push_back(depth_sample(event, samples.size())); });
     const auto result = benchmark.run();
     samples.push_back(depth_sample({"all_stopped", 0, 0, 3, {}, {}}, samples.size()));
-    write_text(output / "summary.json", json::serialize(Object{{"status", "ok"}, {"backend", "lightning"}, {"experiment", "depth"},
+    write_text(output / "summary.json", json::serialize(Object{{"status", "ok"}, {"backend", backend_name}, {"experiment", "depth"},
         {"cleanup_errors", json::array{}}, {"preflight", settings}, {"result", result}}));
     auto save = [&] {
         std::ostringstream data;
@@ -856,7 +888,7 @@ void test_depth_reporting() {
     };
     samples.back()["cgroup"] = Object{{"memory.stat", Object{{"sec_pagetables", 4096}}}};
     save();
-    fs::copy(output, temporary.path() / "lightning/rep-002", fs::copy_options::recursive);
+    fs::copy(output, second_output, fs::copy_options::recursive);
     auto second = samples;
     for (auto& sample : second) {
         if (text(sample.at("phase")) != "depth_ready") continue;
@@ -865,8 +897,8 @@ void test_depth_reporting() {
     }
     std::ostringstream second_data;
     for (const auto& sample : second) second_data << json::serialize(sample) << '\n';
-    write_text(temporary.path() / "lightning/rep-002/samples.jsonl", second_data.str());
-    generate_depth_report(temporary.path());
+    write_text(second_output / "samples.jsonl", second_data.str());
+    generate_figure4_report(temporary.path());
     const auto report = json::parse(read_text(temporary.path() / "comparison.json")).as_object();
     const auto& first_row = report.at("rows").as_array().front().as_object();
     require(integer(first_row.at("guest_ready_ms_samples")) == 2 &&
@@ -877,42 +909,113 @@ void test_depth_reporting() {
         read_text(temporary.path() / "depth.csv").find("verified_private_mib_median") != std::string::npos &&
         read_text(temporary.path() / "dashboard.html").find("AnonHugePages") != std::string::npos,
         "Depth report, separate memory phases or THP evidence missing");
+    if (options.cxl_standin) {
+        require(first_row.at("cxl_newly_frozen_bytes_median").as_double() == 256 * 1048576 &&
+            first_row.at("ready_cxl_frozen_mib_median").as_double() == 254 &&
+            first_row.at("verified_cxl_dram_overlay_mib_median").as_double() == 2 &&
+            read_text(temporary.path() / "dashboard.html").find("local file stand-in") != std::string::npos,
+            "CXL depth metrics or backing label missing");
+        auto& metadata = samples[2]["extra"].as_object()["backend_metadata"].as_object();
+        metadata["cxl_frozen_bytes"] = 0; save();
+        bool rejected = false;
+        try { generate_figure4_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
+        require(rejected, "CXL reporter accepted a first fork without a pool freeze");
+        metadata["cxl_frozen_bytes"] = 256 * 1048576;
+    }
     samples[4]["extra"].as_object()["source_id"] = 0; save();
     bool rejected = false;
-    try { generate_depth_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
+    try { generate_figure4_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
     require(rejected && text(json::parse(read_text(temporary.path() / "reporting-status.json")).as_object().at("status")) == "failed",
         "Depth reporter accepted a sibling fanout as a chain");
     samples[4]["extra"].as_object()["source_id"] = 1;
     samples[4]["processes"].as_array().front().as_object()["pid"] = 9999; save(); rejected = false;
-    try { generate_depth_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
+    try { generate_figure4_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
     require(rejected, "Depth reporter accepted replacement of a retained ancestor");
     samples[4]["processes"].as_array().front().as_object()["pid"] = backend.nodes.front()->pid;
     samples.pop_back(); save(); rejected = false;
-    try { generate_depth_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
+    try { generate_figure4_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
     require(rejected, "Depth report accepted missing final teardown");
 }
-void test_firecracker_depth() {
-    require_socket_access();
+void test_depth_reporting() {
+    check_depth_reporting("lightning");
+    check_depth_reporting("lightning-cxl");
+}
+void test_footprint_reporting() {
+    TemporaryDirectory temporary(fs::temp_directory_path());
+    auto options = parse({"benchmark", "--experiment", "footprint", "--backend", "lightning-cxl",
+        "--cxl-standin", "--duration-s", "2", "--settle-ms", "0"});
+    auto settings = inspect_host(options);
+    settings["backends"] = json::array{options.backend};
+    settings["repetitions"] = 1;
+    settings["snapshot_type"] = "diff";
+    write_text(temporary.path() / "settings.json", json::serialize(settings));
+    const auto output = temporary.path() / options.backend / "rep-001";
+    fs::create_directories(output);
+    Figure4Fake backend;
+    backend.siblings = true;
+    backend.cxl_memory_mib = options.memory_mib;
+    std::vector<Object> samples{depth_sample({"before_boot", 0, 0, 0, {}, {}}, 0)};
+    FootprintBenchmark benchmark(backend, options, [&](const MeasurementEvent& event) {
+        samples.push_back(depth_sample(event, samples.size()));
+    });
+    const auto result = benchmark.run();
+    require(integer(result.at("maximum_live_vms")) == 17 && integer(result.at("samples_completed")) == 2,
+        "Footprint cohort or sampling window did not complete");
+    backend.cleanup();
+    samples.push_back(depth_sample({"all_stopped", 0, 0, 16, {}, {}}, samples.size()));
+    write_text(output / "summary.json", json::serialize(Object{{"status", "ok"}, {"backend", options.backend},
+        {"experiment", "footprint"}, {"cleanup_errors", json::array{}}, {"preflight", settings}, {"result", result}}));
+    auto save = [&] {
+        std::ostringstream raw;
+        for (const auto& sample : samples) raw << json::serialize(sample) << '\n';
+        write_text(output / "samples.jsonl", raw.str());
+    };
+    save();
+    generate_figure4_report(temporary.path());
+    const auto report = json::parse(read_text(temporary.path() / "comparison.json")).as_object();
+    const auto& rows = report.at("rows").as_array();
+    const auto csv = read_text(temporary.path() / "footprint.csv");
+    require(rows.size() == 2 && integer(rows.back().as_object().at("private_mib_samples")) == 16 &&
+        std::count(csv.begin(), csv.end(), '\n') == 33 && csv.find("cxl_dram_overlay_bytes") != std::string::npos &&
+        integer(report.at("cohorts").as_array().front().as_object().at("final_live_vms")) == 0,
+        "Footprint report omitted per-child samples or teardown");
+    samples[18]["extra"].as_object()["elapsed_ns"] = 2000000000LL;
+    save();
+    bool rejected = false;
+    try { generate_figure4_report(temporary.path()); } catch (const std::exception&) { rejected = true; }
+    require(rejected, "Footprint reporter accepted a missed sampling window");
+}
+void check_firecracker_figure4(bool footprint) {
     for (const auto* type : {"diff", "full"}) {
         TemporaryDirectory temporary(fs::temp_directory_path());
-        Options options; options.experiment = "depth"; options.depth = 3; options.populate_mib = 1; options.settle_ms = 0;
+        Options options; options.experiment = footprint ? "footprint" : "depth";
+        options.depth = 3; options.children = 3; options.duration_s = 1; options.populate_mib = 1; options.settle_ms = 0;
         options.snapshot_type = type; options.backend = "firecracker";
         options.firecracker = fs::read_symlink("/proc/self/exe"); options.output = temporary.path();
         auto backend = make_backend(options, temporary.path());
         int observed = 0;
-        DepthBenchmark benchmark(*backend, options, [&](const MeasurementEvent& event) {
-            if (event.phase != "depth_ready") return;
-            require(event.extra.at("backend_metadata").as_object().at("child_track_dirty_pages").as_bool() == (options.snapshot_type == "diff"),
-                "Restored depth source dirty tracking does not match snapshot mode");
+        const auto observer = [&](const MeasurementEvent& event) {
+            if (event.phase != (footprint ? "sibling_ready" : "depth_ready")) return;
+            require(event.extra.at("backend_metadata").as_object().at("child_track_dirty_pages").as_bool() ==
+                (!footprint && options.snapshot_type == "diff"), "Restored child dirty tracking does not match its role");
             ++observed;
-        });
-        benchmark.run();
-        require(observed == 3 && read_text(temporary.path() / "f1.sock.trace").find("PUT /snapshot/create") != std::string::npos &&
-            read_text(temporary.path() / "f2.sock.trace").find("PUT /snapshot/create") != std::string::npos,
-            "Firecracker depth did not snapshot restored descendants");
+        };
+        if (footprint) FootprintBenchmark(*backend, options, observer).run();
+        else DepthBenchmark(*backend, options, observer).run();
+        for (int id : {1, 2}) {
+            const auto trace = read_text(temporary.path() / ("f" + std::to_string(id) + ".sock.trace"));
+            require((trace.find("PUT /snapshot/create") != std::string::npos) == !footprint,
+                "Figure 4 captured a snapshot from the wrong VM");
+        }
+        require(observed == 3, "Figure 4 lost a Firecracker child");
         require(backend->cleanup().empty() && !fs::exists(temporary.path() / "base.mem") && !fs::exists(temporary.path() / "c3.mem"),
-            "Depth cleanup retained Firecracker backing");
+            "Figure 4 cleanup retained Firecracker backing");
     }
+}
+void test_firecracker_figure4() {
+    require_socket_access();
+    check_firecracker_figure4(false);
+    check_firecracker_figure4(true);
 }
 }
 
@@ -925,7 +1028,8 @@ int main(int argc, char** argv) {
     const std::vector<std::pair<const char*, void(*)()>> tests = {
         {"depth-64 retained chain", test_depth_lifecycle}, {"depth inheritance/scan/isolation failures", test_depth_validation},
         {"depth CLI and THP policy", test_depth_cli}, {"saved depth reporting and rejection", test_depth_reporting},
-        {"Firecracker recursive full/diff sources (simulated API)", test_firecracker_depth},
+        {"Figure 4(a) retained siblings and per-child CXL reporting", test_footprint_reporting},
+        {"Figure 4 Firecracker full/diff sources (simulated API)", test_firecracker_figure4},
         {"2500-fork batch lifecycle", test_batch_lifecycle}, {"inheritance failure detection", test_inheritance_failure},
         {"proc parser", test_proc_parser}, {"live process collection", test_live_process_collection},
         {"minimal cgroup categories", test_cgroup_filter}, {"KVM PID matching", test_kvm_pid_matching},

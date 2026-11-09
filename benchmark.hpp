@@ -73,11 +73,15 @@ private:
 }
 
 namespace vmbench {
-enum class Command { Run, Help, Preflight, SelfTest, ReportOnly, DepthReport };
+enum class Command { Run, Help, Preflight, SelfTest, ReportOnly, Figure4Report };
 struct Options {
     fs::path repo, firecracker_repo, lightning, firecracker, kernel, initrd, output, work_dir = "/tmp", cgroup;
+    fs::path cxl_pool;
+    std::optional<uint64_t> cxl_offset;
+    bool cxl_standin = false;
     std::string backend, huge_pages = "None", snapshot_type = "diff", experiment = "batch";
     int depth = 64, populate_mib = 64;
+    int children = 16, duration_s = 60;
     int rounds = 50, per_round = 50, memory_mib = 256, vcpus = 1, settle_ms = 200;
     Command command = Command::Run;
 };
@@ -137,6 +141,7 @@ public:
     virtual void marker(const VmHandle& root, int round) = 0;
     virtual Object ready(const VmHandle& vm) = 0;
     virtual Object command(const VmHandle&, const std::string&) { throw std::runtime_error("Guest commands unsupported by backend"); }
+    virtual Object cxl_usage(const VmHandle&) { throw std::runtime_error("CXL accounting unsupported by backend"); }
     virtual Object prepare_round(const VmHandle& root, int round) = 0;
     virtual CloneResult clone(const VmHandle& root, int id) = 0;
     virtual void destroy(const VmHandle& vm) = 0;
@@ -144,6 +149,8 @@ public:
     virtual json::array cleanup() = 0;
 };
 std::unique_ptr<Backend> make_backend(const Options& options, const fs::path& work);
+void validate_cxl_usage(const Object& usage, int memory_mib, bool before_fork);
+void validate_cxl_fork(const Object& metadata, int memory_mib, int depth);
 std::string copy_snapshot_memory(const fs::path& source, const fs::path& destination, bool allow_reflink = true);
 }
 
@@ -237,8 +244,21 @@ private:
     Observer observer_;
     VmList chain_;
 };
+class FootprintBenchmark {
+public:
+    FootprintBenchmark(Backend& backend, const Options& options, Observer observer);
+    Object run();
+private:
+    void fork_child(int id);
+    void verify_family();
+    void sample_memory();
+    Backend& backend_;
+    const Options& options_;
+    Observer observer_;
+    VmList family_;
+};
 uint64_t populated_checksum(int memory_mib);
-void generate_depth_report(const fs::path& directory);
+void generate_figure4_report(const fs::path& directory);
 }
 
 namespace vmbench {

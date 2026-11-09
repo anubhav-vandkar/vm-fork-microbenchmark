@@ -38,6 +38,7 @@ public:
     VmHandle boot() override;
     Object prepare_round(const VmHandle& root, int round) override;
     CloneResult clone(const VmHandle& root, int id) override;
+    Object cxl_usage(const VmHandle& vm) override;
     void destroy(const VmHandle& vm) override;
     void release_round(const VmHandle& root) override;
 };
@@ -258,12 +259,43 @@ json::array ManagedBackend::cleanup() {
 }
 
 namespace vmbench {
+void validate_cxl_usage(const Object& usage, int memory_mib, bool before_fork) {
+    constexpr int64_t chunk = 2LL << 20;
+    const auto bytes = static_cast<int64_t>(memory_mib) << 20;
+    int64_t total = 0;
+    for (const auto* key : {"writable", "frozen", "private"}) {
+        const auto count = integer(usage.at(key));
+        require(count >= 0 && count <= bytes && count % chunk == 0, "Invalid Lightning CXL chunk accounting");
+        total += count;
+    }
+    require(total == bytes, "Lightning CXL usage does not account for configured guest RAM");
+    require(before_fork ? integer(usage.at("writable")) == bytes
+                        : integer(usage.at("writable")) == 0 && integer(usage.at("frozen")) > 0,
+        "Expected a writable root pool before fork and a nonempty frozen pool mapping in each descendant");
+}
+void validate_cxl_fork(const Object& metadata, int memory_mib, int depth) {
+    const auto bytes = static_cast<int64_t>(memory_mib) << 20;
+    require(metadata.contains("cxl_frozen_bytes") && metadata.contains("cxl_freeze_us") &&
+        integer(metadata.at("cxl_frozen_bytes")) == (depth == 1 ? bytes : 0) &&
+        integer(metadata.at("cxl_freeze_us")) >= 0,
+        "Lightning must report freezing the full pool on the first fork and zero new bytes on later forks");
+}
+
 VmHandle LightningBackend::boot() {
     const auto control = work_ / "root.sock";
     const auto vsock = work_ / "root-v.sock";
     const auto config_path = work_ / "config.json";
     auto configuration = guest_configuration(options_, vsock);
     configuration["drives"] = json::array{};
+    if (options_.backend == "lightning-cxl") {
+        auto pool = options_.cxl_pool;
+        if (options_.cxl_standin) {
+            pool = work_ / "cxl-pool";
+            FileDescriptor file(open(pool.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
+            require(file.get() >= 0, "Cannot create the private CXL stand-in");
+        }
+        configuration["cxl"] = Object{{"path", pool.string()}, {"offset", options_.cxl_offset.value_or(0)}};
+    }
     write_text(config_path, json::serialize(configuration));
     const auto pid = launch({options_.lightning.string(), "live", config_path.string(), control.string(),
         (work_ / "children").string(), "--no-seccomp"}, "lightning-root");
@@ -278,6 +310,12 @@ CloneResult LightningBackend::clone(const VmHandle& root, int id) {
     auto child = processes_.track(id, static_cast<pid_t>(integer(response.at("pid"))),
         text(response.at("control_path")), text(response.at("vsock_path")));
     return {child, std::move(response)};
+}
+Object LightningBackend::cxl_usage(const VmHandle& vm) {
+    const auto response = lightning_request(vm->control, {{"op", "status"}});
+    const auto usage = response.if_contains("cxl");
+    require(usage && usage->is_object(), "Lightning did not report an active CXL pool");
+    return usage->as_object();
 }
 void LightningBackend::destroy(const VmHandle& vm) {
     if (!vm->alive) return;
@@ -474,8 +512,8 @@ json::array FirecrackerBackend::cleanup() {
 
 namespace vmbench {
 std::unique_ptr<Backend> make_backend(const Options& options, const fs::path& work) {
-    if (options.backend == "lightning") return std::make_unique<LightningBackend>(options, work);
+    if (options.backend == "lightning" || options.backend == "lightning-cxl") return std::make_unique<LightningBackend>(options, work);
     if (options.backend == "firecracker") return std::make_unique<FirecrackerBackend>(options, work);
-    throw std::runtime_error("Choose --backend lightning or firecracker");
+    throw std::runtime_error("Choose --backend lightning, lightning-cxl or firecracker");
 }
 }
